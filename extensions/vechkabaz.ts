@@ -10,7 +10,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 const PROVIDER = "vechkabaz";
@@ -213,7 +213,6 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  let subagentBusy = false;
   const isOrchestrator = (m: { provider?: string; id?: string } | undefined) =>
     m?.provider === PROVIDER && m?.id === ORCHESTRATOR_ID;
   // Hidden, not refused: its guidelines leave the prompt too, and smaller models
@@ -224,85 +223,118 @@ export default async function (pi: ExtensionAPI) {
   };
   pi.on("session_start", async (_e, ctx) => syncSubagent(ctx.model));
   pi.on("model_select", async (e) => syncSubagent(e.model));
+
+  // One background helper at a time; its report is injected when it finishes.
+  let running: { id: number; kill: () => void } | undefined;
+  let nextId = 1;
+  pi.on("session_shutdown", async () => running?.kill());
+
+  /** Runs the child pi to completion; resolves with its last assistant text. */
+  const runChild = (task: string, cwd: string, onStep: (steps: number) => void) => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-vechkabaz-sub-"));
+    const promptFile = join(dir, "subagent.md");
+    writeFileSync(promptFile, SUBAGENT_PROMPT, { mode: 0o600 });
+    const script = process.argv[1];
+    const [cmd, pre] = script && existsSync(script) ? [process.execPath, [script]] : ["pi", []];
+    const args = [...pre, "--mode", "json", "-p", "--no-session", "--model", SUBAGENT_MODEL,
+      "--tools", SUBAGENT_TOOLS, "--append-system-prompt", promptFile, `Task: ${task}`];
+    const proc = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_VECHKABAZ_SUBAGENT: "1" } });
+    const kill = () => {
+      proc.kill("SIGTERM");
+      setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
+    };
+    const done = new Promise<{ report: string; steps: number; error?: string }>((resolve) => {
+      let report = "";
+      let steps = 0;
+      let stderr = "";
+      let buf = "";
+      const timer = setTimeout(kill, SUBAGENT_TIMEOUT_MS);
+      proc.stdout.on("data", (d) => {
+        buf += d.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          let e: any;
+          try {
+            e = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (e.type === "tool_execution_start") onStep(++steps);
+          if (e.type === "message_end" && e.message?.role === "assistant") {
+            const text = (e.message.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+            if (text.trim()) report = text;
+          }
+        }
+      });
+      proc.stderr.on("data", (d) => (stderr += d.toString()));
+      const finish = (code: number | null) => {
+        clearTimeout(timer);
+        rmSync(dir, { recursive: true, force: true });
+        resolve(report ? { report, steps } : { report, steps, error: `exit ${code}: ${stderr.trim().slice(-400) || "no report"}` });
+      };
+      proc.on("close", finish);
+      proc.on("error", () => finish(1));
+    });
+    return { done, kill };
+  };
+
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
     description:
-      "Hand a self-contained research task to a read-only helper with its own context. It can read files and search the web, and returns a written report.",
-    promptSnippet: "Delegate broad read-only investigation and get a report back",
+      "Start a read-only helper on a self-contained research task. Returns immediately; the helper's report arrives later as a message in this conversation.",
+    promptSnippet: "Delegate broad read-only investigation in the background; its report arrives later",
     promptGuidelines: [
       "Use subagent for investigation that would take many file reads or searches (mapping an unfamiliar codebase, finding every usage of something, researching a library), so those contents stay out of your context. Give it a complete, self-contained task.",
+      "subagent runs in the background: after starting it, tell the user and carry on with other work. Do not wait or poll for it; its report arrives on its own as a message.",
       "subagent cannot edit files or run commands; do the changes yourself from its report.",
     ],
     parameters: Type.Object({ task: Type.String({ description: "Complete instructions for the helper, including what to report back" }) }),
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       if (!isOrchestrator(ctx.model)) {
         return { content: [{ type: "text", text: `subagent is only available on ${PROVIDER}/${ORCHESTRATOR_ID}.` }], details: {} };
       }
-      if (subagentBusy) {
-        return { content: [{ type: "text", text: "subagent is already running a task; wait for it or do this yourself." }], details: {} };
+      if (running) {
+        return { content: [{ type: "text", text: `subagent #${running.id} is still running; its report will arrive when it finishes. Start another after that.` }], details: {} };
       }
-      subagentBusy = true;
-      const dir = mkdtempSync(join(tmpdir(), "pi-vechkabaz-sub-"));
-      const promptFile = join(dir, "subagent.md");
-      writeFileSync(promptFile, SUBAGENT_PROMPT, { mode: 0o600 });
-      const script = process.argv[1];
-      const [cmd, pre] = script && existsSync(script) ? [process.execPath, [script]] : ["pi", []];
-      const args = [...pre, "--mode", "json", "-p", "--no-session", "--model", SUBAGENT_MODEL,
-        "--tools", SUBAGENT_TOOLS, "--append-system-prompt", promptFile, `Task: ${params.task}`];
-      let report = "";
-      let steps = 0;
-      let stderr = "";
-      try {
-        const code = await new Promise<number>((resolve) => {
-          const proc = spawn(cmd, args, {
-            cwd: ctx.cwd,
-            stdio: ["ignore", "pipe", "pipe"],
-            env: { ...process.env, PI_VECHKABAZ_SUBAGENT: "1" },
-          });
-          const kill = () => {
-            proc.kill("SIGTERM");
-            setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
-          };
-          const timer = setTimeout(kill, SUBAGENT_TIMEOUT_MS);
-          signal?.addEventListener("abort", kill, { once: true });
-          let buf = "";
-          proc.stdout.on("data", (d) => {
-            buf += d.toString();
-            const lines = buf.split("\n");
-            buf = lines.pop() ?? "";
-            for (const line of lines) {
-              let e: any;
-              try {
-                e = JSON.parse(line);
-              } catch {
-                continue;
-              }
-              if (e.type === "tool_execution_start") {
-                steps++;
-                onUpdate?.({ content: [{ type: "text", text: `subagent: ${e.toolName} (${steps} steps)` }], details: {} });
-              }
-              if (e.type === "message_end" && e.message?.role === "assistant") {
-                const text = (e.message.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
-                if (text.trim()) report = text;
-              }
-            }
-          });
-          proc.stderr.on("data", (d) => (stderr += d.toString()));
-          proc.on("close", (c) => {
-            clearTimeout(timer);
-            resolve(c ?? 1);
-          });
-          proc.on("error", () => resolve(1));
-        });
-        if (!report) {
-          return { content: [{ type: "text", text: `subagent failed (exit ${code}): ${stderr.trim().slice(-400) || "no report"}` }], details: { steps } };
-        }
-        return { content: [{ type: "text", text: report }], details: { steps } };
-      } finally {
-        subagentBusy = false;
-        rmSync(dir, { recursive: true, force: true });
-      }
+      const id = nextId++;
+      const started = Date.now();
+      const status = (steps: number) =>
+        ctx.ui.setStatus("subagent", `subagent #${id}: ${steps} steps, ${Math.round((Date.now() - started) / 1000)}s`);
+      status(0);
+      const child = runChild(params.task, ctx.cwd, status);
+      running = { id, kill: child.kill };
+      void child.done.then(({ report, steps, error }) => {
+        running = undefined;
+        ctx.ui.setStatus("subagent", undefined);
+        const secs = Math.round((Date.now() - started) / 1000);
+        pi.sendMessage(
+          {
+            customType: "subagent-report",
+            content: error
+              ? `Subagent #${id} failed after ${secs}s (${error}).\nTask: ${params.task}`
+              : `Subagent #${id} report (${steps} steps, ${secs}s).\nTask: ${params.task}\n\n${report}`,
+            display: true,
+            details: { id, steps, secs, ok: !error },
+          },
+          // After the current turn's tool calls, never mid-turn; answers at once if idle.
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      });
+      return {
+        content: [{ type: "text", text: `Started subagent #${id} in the background. Its report will arrive as a message when it finishes; continue meanwhile.` }],
+        details: { id },
+      };
+    },
+  });
+
+  pi.registerCommand("subagent-stop", {
+    description: "Stop the running subagent",
+    handler: async (_args, ctx) => {
+      if (!running) return ctx.ui.notify("No subagent is running.", "info");
+      running.kill();
+      ctx.ui.notify(`Stopping subagent #${running.id}.`, "info");
     },
   });
 
