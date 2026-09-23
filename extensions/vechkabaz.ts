@@ -3,14 +3,14 @@
  * migrates any hand-written provider entry for this server out of models.json
  * (models.json overrides extension providers, so a stale entry would win).
  */
-import { execSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { execSync, spawn } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 const PROVIDER = "vechkabaz";
@@ -18,14 +18,28 @@ const DEFAULT_MODEL = "coder-max";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const KEY_FILE = join(AGENT_DIR, "vechkabaz.json");
 const HEADERS = { "User-Agent": `pi-vechkabaz/${VERSION}` };
+// The server pins this id to the second GPU, so a subagent never evicts the parent's model.
+const SUBAGENT_MODEL = `${PROVIDER}/coder-sub`;
+// Only this parent model gets the subagent tool; everything else never sees it.
+const ORCHESTRATOR_ID = "coder-max";
+// Set on the child pi process only: the server doesn't list coder-sub, and it must
+// never show up in a person's /model picker.
+const IS_SUBAGENT = process.env.PI_VECHKABAZ_SUBAGENT === "1";
+const SUBAGENT_TOOLS = "read,grep,find,ls,web_search,web_fetch";
+const SUBAGENT_TIMEOUT_MS = 10 * 60_000;
+const SUBAGENT_PROMPT = `You are a read-only research subagent working for another agent.
+Investigate the task with read, grep, find, ls, web_search and web_fetch. You cannot edit
+files or run commands, and nobody will answer questions, so do not ask any.
+Finish with a concise report: what you found, with file paths and line numbers or URLs,
+and anything you could not confirm.`;
 
 /** What each server model can do; ids the server lists but this table lacks get defaults. */
 const PROFILES: Record<string, { name: string; image: boolean; ctx: number }> = {
   "coder-max": { name: "coder-max (careful, 27B)", image: true, ctx: 131072 },
   coder: { name: "coder (fast)", image: true, ctx: 262144 },
-  deep: { name: "deep (largest)", image: false, ctx: 32768 },
   "fable-711": { name: "fable-711 (peer machine)", image: false, ctx: 32768 },
   uncensored: { name: "uncensored", image: true, ctx: 131072 },
+  "coder-sub": { name: "coder-sub (subagent, second GPU)", image: true, ctx: 65536 },
 };
 
 // The server accepts off|low|medium|high|xhigh (plus minimal/none aliases).
@@ -151,6 +165,7 @@ export default async function (pi: ExtensionAPI) {
   } catch {
     // Offline or no key yet: the built-in pair is enough to start.
   }
+  if (IS_SUBAGENT) modelList.push(toModel("coder-sub"));
 
   const register = () =>
     pi.registerProvider(PROVIDER, {
@@ -195,6 +210,99 @@ export default async function (pi: ExtensionAPI) {
     description: "Set or replace your ai.vechkabaz.com API key",
     handler: async (_args, ctx) => {
       await askForKey(ctx);
+    },
+  });
+
+  let subagentBusy = false;
+  const isOrchestrator = (m: { provider?: string; id?: string } | undefined) =>
+    m?.provider === PROVIDER && m?.id === ORCHESTRATOR_ID;
+  // Hidden, not refused: its guidelines leave the prompt too, and smaller models
+  // stay under their tool budget.
+  const syncSubagent = (m: { provider?: string; id?: string } | undefined) => {
+    const active = pi.getActiveTools().filter((t) => t !== "subagent");
+    pi.setActiveTools(isOrchestrator(m) ? [...active, "subagent"] : active);
+  };
+  pi.on("session_start", async (_e, ctx) => syncSubagent(ctx.model));
+  pi.on("model_select", async (e) => syncSubagent(e.model));
+  pi.registerTool({
+    name: "subagent",
+    label: "Subagent",
+    description:
+      "Hand a self-contained research task to a read-only helper with its own context. It can read files and search the web, and returns a written report.",
+    promptSnippet: "Delegate broad read-only investigation and get a report back",
+    promptGuidelines: [
+      "Use subagent for investigation that would take many file reads or searches (mapping an unfamiliar codebase, finding every usage of something, researching a library), so those contents stay out of your context. Give it a complete, self-contained task.",
+      "subagent cannot edit files or run commands; do the changes yourself from its report.",
+    ],
+    parameters: Type.Object({ task: Type.String({ description: "Complete instructions for the helper, including what to report back" }) }),
+    async execute(_id, params, signal, onUpdate, ctx) {
+      if (!isOrchestrator(ctx.model)) {
+        return { content: [{ type: "text", text: `subagent is only available on ${PROVIDER}/${ORCHESTRATOR_ID}.` }], details: {} };
+      }
+      if (subagentBusy) {
+        return { content: [{ type: "text", text: "subagent is already running a task; wait for it or do this yourself." }], details: {} };
+      }
+      subagentBusy = true;
+      const dir = mkdtempSync(join(tmpdir(), "pi-vechkabaz-sub-"));
+      const promptFile = join(dir, "subagent.md");
+      writeFileSync(promptFile, SUBAGENT_PROMPT, { mode: 0o600 });
+      const script = process.argv[1];
+      const [cmd, pre] = script && existsSync(script) ? [process.execPath, [script]] : ["pi", []];
+      const args = [...pre, "--mode", "json", "-p", "--no-session", "--model", SUBAGENT_MODEL,
+        "--tools", SUBAGENT_TOOLS, "--append-system-prompt", promptFile, `Task: ${params.task}`];
+      let report = "";
+      let steps = 0;
+      let stderr = "";
+      try {
+        const code = await new Promise<number>((resolve) => {
+          const proc = spawn(cmd, args, {
+            cwd: ctx.cwd,
+            stdio: ["ignore", "pipe", "pipe"],
+            env: { ...process.env, PI_VECHKABAZ_SUBAGENT: "1" },
+          });
+          const kill = () => {
+            proc.kill("SIGTERM");
+            setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
+          };
+          const timer = setTimeout(kill, SUBAGENT_TIMEOUT_MS);
+          signal?.addEventListener("abort", kill, { once: true });
+          let buf = "";
+          proc.stdout.on("data", (d) => {
+            buf += d.toString();
+            const lines = buf.split("\n");
+            buf = lines.pop() ?? "";
+            for (const line of lines) {
+              let e: any;
+              try {
+                e = JSON.parse(line);
+              } catch {
+                continue;
+              }
+              if (e.type === "tool_execution_start") {
+                steps++;
+                onUpdate?.({ content: [{ type: "text", text: `subagent: ${e.toolName} (${steps} steps)` }], details: {} });
+              }
+              if (e.type === "message_end" && e.message?.role === "assistant") {
+                const text = (e.message.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+                if (text.trim()) report = text;
+              }
+            }
+          });
+          proc.stderr.on("data", (d) => (stderr += d.toString()));
+          proc.on("close", (c) => {
+            clearTimeout(timer);
+            resolve(c ?? 1);
+          });
+          proc.on("error", () => resolve(1));
+        });
+        if (!report) {
+          return { content: [{ type: "text", text: `subagent failed (exit ${code}): ${stderr.trim().slice(-400) || "no report"}` }], details: { steps } };
+        }
+        return { content: [{ type: "text", text: report }], details: { steps } };
+      } finally {
+        subagentBusy = false;
+        rmSync(dir, { recursive: true, force: true });
+      }
     },
   });
 
