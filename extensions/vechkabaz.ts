@@ -42,7 +42,7 @@ const PROFILES: Record<string, { name: string; image: boolean; ctx: number }> = 
   coder: { name: "coder (fast)", image: true, ctx: 262144 },
   "fable-711": { name: "fable-711 (peer machine)", image: false, ctx: 32768 },
   uncensored: { name: "uncensored", image: true, ctx: 131072 },
-  "coder-sub": { name: "coder-sub (subagent, second GPU)", image: true, ctx: 65536 },
+  "coder-sub": { name: "coder-sub (subagent, second GPU)", image: true, ctx: 131072 },
 };
 
 // The server accepts off|low|medium|high|xhigh (plus minimal/none aliases).
