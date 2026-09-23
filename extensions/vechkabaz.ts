@@ -7,6 +7,7 @@ import { execSync, spawn } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -26,6 +27,9 @@ const ORCHESTRATOR_ID = "coder-max";
 // never show up in a person's /model picker.
 const IS_SUBAGENT = process.env.PI_VECHKABAZ_SUBAGENT === "1";
 const SUBAGENT_TOOLS = "read,grep,find,ls,web_search,web_fetch";
+// The child loads exactly this file, so it runs the parent's version even when the
+// parent was started with -e (nothing installed) and picks up no other extensions.
+const SELF = fileURLToPath(import.meta.url);
 const SUBAGENT_TIMEOUT_MS = 10 * 60_000;
 // The server allows 3 harness turns in flight per account and the parent's own turn
 // is one of them, so 2 helpers is the most that fit beside an active conversation.
@@ -241,7 +245,7 @@ export default async function (pi: ExtensionAPI) {
     writeFileSync(promptFile, SUBAGENT_PROMPT, { mode: 0o600 });
     const script = process.argv[1];
     const [cmd, pre] = script && existsSync(script) ? [process.execPath, [script]] : ["pi", []];
-    const args = [...pre, "--mode", "json", "-p", "--no-session", "--model", SUBAGENT_MODEL,
+    const args = [...pre, "--no-extensions", "-e", SELF, "--mode", "json", "-p", "--no-session", "--model", SUBAGENT_MODEL,
       "--tools", SUBAGENT_TOOLS, "--append-system-prompt", promptFile, `Task: ${task}`];
     const proc = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_VECHKABAZ_SUBAGENT: "1" } });
     const kill = () => {
