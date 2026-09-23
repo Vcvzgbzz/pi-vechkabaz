@@ -1,6 +1,6 @@
 {
   "name": "pi-vechkabaz",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Connects pi to ai.vechkabaz.com: models, web search and page fetch, with a one-time key prompt.",
   "keywords": [
     "pi-package"

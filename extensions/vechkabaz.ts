@@ -12,7 +12,7 @@ import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-a
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 const PROVIDER = "vechkabaz";
@@ -350,29 +350,22 @@ export default async function (pi: ExtensionAPI) {
           const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`);
           parts.push(`${theme.fg("muted", "ctx ")}${theme.fg(color, "▰".repeat(filled))}${theme.fg("borderMuted", "▱".repeat(10 - filled))} ${theme.fg(color, `${Math.round(u.percent)}%`)} ${theme.fg("dim", `${k(u.tokens)}/${k(u.contextWindow)}`)}`);
         }
-        return new Text(parts.join(theme.fg("borderMuted", "  │  ")), 0, 0);
+        // Running helpers' trails sit above the status line, all below the input.
+        const lines: string[] = [];
+        for (const [n, r] of running) {
+          const task = r.task.replace(/\s+/g, " ");
+          lines.push(
+            theme.fg("accent", `◆ subagent #${n}  `) +
+              theme.fg("dim", `${task.length > 60 ? task.slice(0, 57) + "…" : task} · ${r.steps} steps · ${Math.round((Date.now() - r.started) / 1000)}s`),
+          );
+          r.trail.forEach((t, i) =>
+            lines.push(theme.fg("dim", i === r.trail.length - 1 ? "  └ " : "  ├ ") + (i === r.trail.length - 1 ? theme.fg("accent", t) : theme.fg("muted", t))),
+          );
+        }
+        lines.push(parts.join(theme.fg("borderMuted", "  │  ")));
+        return new Text(lines.join("\n"), 0, 0);
       },
       { placement: "belowEditor" },
-    );
-    // Live trail of each running helper, above the editor; gone when none run.
-    c.ui.setWidget(
-      "vechkabaz-sub",
-      running.size
-        ? (_tui: unknown, theme: any) => {
-            const lines: string[] = [];
-            for (const [n, r] of running) {
-              const task = r.task.replace(/\s+/g, " ");
-              lines.push(
-                theme.fg("accent", `◆ subagent #${n}  `) +
-                  theme.fg("dim", `${task.length > 60 ? task.slice(0, 57) + "…" : task} · ${r.steps} steps · ${Math.round((Date.now() - r.started) / 1000)}s`),
-              );
-              r.trail.forEach((t, i) =>
-                lines.push(theme.fg("dim", i === r.trail.length - 1 ? "  └ " : "  ├ ") + (i === r.trail.length - 1 ? theme.fg("accent", t) : theme.fg("muted", t))),
-              );
-            }
-            return new Text(lines.join("\n"), 0, 0);
-          }
-        : undefined,
     );
   };
   const refreshWarm = async () => {

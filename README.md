@@ -34,7 +34,7 @@ model loads it counts down, based on how long that model's loads have recently t
 in 13.1s · wrote 1.9k at 53.8 t/s · coder-max on B70`. Shown to you only; never sent to
 the model.
 
-**Subagents**: while helpers run, a panel above the input shows each one's last few
+**Subagents**: while helpers run, the block under the input shows each one's last few
 actions (files read, searches). Their reports arrive as a styled card; ctrl+o expands.
 
 **Themes:** `vechkabaz-dark` and `vechkabaz-light`, in the site's colors. Pick one in
