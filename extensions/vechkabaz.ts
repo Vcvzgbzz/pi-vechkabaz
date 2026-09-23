@@ -27,6 +27,9 @@ const ORCHESTRATOR_ID = "coder-max";
 const IS_SUBAGENT = process.env.PI_VECHKABAZ_SUBAGENT === "1";
 const SUBAGENT_TOOLS = "read,grep,find,ls,web_search,web_fetch";
 const SUBAGENT_TIMEOUT_MS = 10 * 60_000;
+// The server allows 3 harness turns in flight per account and the parent's own turn
+// is one of them, so 2 helpers is the most that fit beside an active conversation.
+const MAX_SUBAGENTS = 2;
 const SUBAGENT_PROMPT = `You are a read-only research subagent working for another agent.
 Investigate the task with read, grep, find, ls, web_search and web_fetch. You cannot edit
 files or run commands, and nobody will answer questions, so do not ask any.
@@ -224,10 +227,12 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_start", async (_e, ctx) => syncSubagent(ctx.model));
   pi.on("model_select", async (e) => syncSubagent(e.model));
 
-  // One background helper at a time; its report is injected when it finishes.
-  let running: { id: number; kill: () => void } | undefined;
+  // Background helpers, each report injected when it finishes.
+  const running = new Map<number, { kill: () => void; steps: number; started: number }>();
   let nextId = 1;
-  pi.on("session_shutdown", async () => running?.kill());
+  pi.on("session_shutdown", async () => {
+    for (const r of running.values()) r.kill();
+  });
 
   /** Runs the child pi to completion; resolves with its last assistant text. */
   const runChild = (task: string, cwd: string, onStep: (steps: number) => void) => {
@@ -287,7 +292,7 @@ export default async function (pi: ExtensionAPI) {
     promptSnippet: "Delegate broad read-only investigation in the background; its report arrives later",
     promptGuidelines: [
       "Use subagent for investigation that would take many file reads or searches (mapping an unfamiliar codebase, finding every usage of something, researching a library), so those contents stay out of your context. Give it a complete, self-contained task.",
-      "subagent runs in the background: after starting it, tell the user and carry on with other work. Do not wait or poll for it; its report arrives on its own as a message.",
+      "subagent runs in the background: after starting it, tell the user and carry on with other work. Do not wait or poll for it; its report arrives on its own as a message. Up to 2 can run at once, so split independent questions across two calls.",
       "subagent cannot edit files or run commands; do the changes yourself from its report.",
     ],
     parameters: Type.Object({ task: Type.String({ description: "Complete instructions for the helper, including what to report back" }) }),
@@ -295,19 +300,31 @@ export default async function (pi: ExtensionAPI) {
       if (!isOrchestrator(ctx.model)) {
         return { content: [{ type: "text", text: `subagent is only available on ${PROVIDER}/${ORCHESTRATOR_ID}.` }], details: {} };
       }
-      if (running) {
-        return { content: [{ type: "text", text: `subagent #${running.id} is still running; its report will arrive when it finishes. Start another after that.` }], details: {} };
+      if (running.size >= MAX_SUBAGENTS) {
+        return {
+          content: [{ type: "text", text: `${MAX_SUBAGENTS} subagents are already running (#${[...running.keys()].join(", #")}); start another once one reports back.` }],
+          details: {},
+        };
       }
       const id = nextId++;
       const started = Date.now();
-      const status = (steps: number) =>
-        ctx.ui.setStatus("subagent", `subagent #${id}: ${steps} steps, ${Math.round((Date.now() - started) / 1000)}s`);
-      status(0);
-      const child = runChild(params.task, ctx.cwd, status);
-      running = { id, kill: child.kill };
+      const status = () =>
+        ctx.ui.setStatus(
+          "subagent",
+          running.size
+            ? [...running].map(([n, r]) => `subagent #${n}: ${r.steps} steps, ${Math.round((Date.now() - r.started) / 1000)}s`).join(" · ")
+            : undefined,
+        );
+      const child = runChild(params.task, ctx.cwd, (steps) => {
+        const r = running.get(id);
+        if (r) r.steps = steps;
+        status();
+      });
+      running.set(id, { kill: child.kill, steps: 0, started });
+      status();
       void child.done.then(({ report, steps, error }) => {
-        running = undefined;
-        ctx.ui.setStatus("subagent", undefined);
+        running.delete(id);
+        status();
         const secs = Math.round((Date.now() - started) / 1000);
         pi.sendMessage(
           {
@@ -330,11 +347,14 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("subagent-stop", {
-    description: "Stop the running subagent",
-    handler: async (_args, ctx) => {
-      if (!running) return ctx.ui.notify("No subagent is running.", "info");
-      running.kill();
-      ctx.ui.notify(`Stopping subagent #${running.id}.`, "info");
+    description: "Stop running subagents (all, or one by number: /subagent-stop 2)",
+    handler: async (args, ctx) => {
+      if (!running.size) return ctx.ui.notify("No subagent is running.", "info");
+      const want = Number(String(args ?? "").trim().replace(/^#/, "")) || undefined;
+      const ids = want ? [want].filter((n) => running.has(n)) : [...running.keys()];
+      if (!ids.length) return ctx.ui.notify(`No running subagent #${want}.`, "warning");
+      for (const n of ids) running.get(n)!.kill();
+      ctx.ui.notify(`Stopping subagent #${ids.join(", #")}.`, "info");
     },
   });
 
