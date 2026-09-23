@@ -26,6 +26,13 @@ replaces that entry with this one, keeps your key, and saves a backup next to th
   files or run commands.
 - `/vechkabaz-key` to change your key later.
 
+**Status line** (below the input): whether your model is warm or will load on the next
+turn, the subagent helper's state on `coder-max`, a context-window bar, and running
+subagents. Subagent reports arrive as a styled card; ctrl+o expands them.
+
+**Themes:** `vechkabaz-dark` and `vechkabaz-light`, in the site's colors. Pick one in
+`/settings` → theme.
+
 **Screenshots:** paste with **Ctrl+V** (Cmd+V only pastes text in a terminal), or drag
 the image file onto the pi window.
 

@@ -8,10 +8,11 @@ import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync,
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 const PROVIDER = "vechkabaz";
@@ -288,6 +289,91 @@ export default async function (pi: ExtensionAPI) {
     return { done, kill };
   };
 
+  /* ---------------------------------------------------------------- status line
+   * Below the editor: the model's warm/cold state, the B60 helper's (on the
+   * orchestrator), a context bar, and running subagents. */
+  let warm: Set<string> | undefined;
+  let barCtx: any;
+  const renderBar = (ctx?: any) => {
+    if (ctx) barCtx = ctx;
+    const c = barCtx;
+    if (IS_SUBAGENT || !c?.hasUI) return;
+    c.ui.setWidget(
+      "vechkabaz",
+      (_tui: unknown, theme: any) => {
+        const parts: string[] = [];
+        const m = c.model;
+        if (m?.provider === PROVIDER) {
+          const w = warm?.has(m.id);
+          parts.push(
+            w === undefined ? theme.fg("dim", `◌ ${m.id}`)
+            : w ? theme.fg("success", `● ${m.id} warm`)
+            : theme.fg("warning", `○ ${m.id} cold (loads on next turn)`),
+          );
+          if (isOrchestrator(m) && warm) {
+            parts.push(warm.has("coder-sub") ? theme.fg("success", "● helper warm") : theme.fg("dim", "○ helper cold"));
+          }
+        }
+        const u = c.getContextUsage?.();
+        if (u?.percent != null && u.tokens != null) {
+          const filled = Math.min(10, Math.round(u.percent / 10));
+          const color = u.percent >= 85 ? "error" : u.percent >= 60 ? "warning" : "success";
+          const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`);
+          parts.push(`${theme.fg("muted", "ctx ")}${theme.fg(color, "▰".repeat(filled))}${theme.fg("borderMuted", "▱".repeat(10 - filled))} ${theme.fg(color, `${Math.round(u.percent)}%`)} ${theme.fg("dim", `${k(u.tokens)}/${k(u.contextWindow)}`)}`);
+        }
+        for (const [n, r] of running) {
+          parts.push(theme.fg("accent", `◆ subagent #${n} `) + theme.fg("dim", `${r.steps} steps · ${Math.round((Date.now() - r.started) / 1000)}s`));
+        }
+        return new Text(parts.join(theme.fg("borderMuted", "  │  ")), 0, 0);
+      },
+      { placement: "belowEditor" },
+    );
+  };
+  const refreshWarm = async () => {
+    try {
+      const r = await api("/models", resolveKey(spec), AbortSignal.timeout(8_000));
+      warm = Array.isArray(r.warm) ? new Set(r.warm) : undefined;
+    } catch {
+      warm = undefined;
+    }
+    renderBar();
+  };
+  if (!IS_SUBAGENT) {
+    pi.on("session_start", async (_e, ctx) => {
+      renderBar(ctx);
+      void refreshWarm();
+    });
+    pi.on("model_select", async (_e, ctx) => renderBar(ctx));
+    pi.on("turn_end", async (_e, ctx) => renderBar(ctx));
+    pi.on("agent_end", async (_e, ctx) => {
+      renderBar(ctx);
+      void refreshWarm();
+    });
+    setInterval(() => void refreshWarm(), 30_000).unref();
+    // Keeps elapsed seconds moving while helpers run.
+    setInterval(() => running.size && renderBar(), 1_000).unref();
+  }
+
+  /* ------------------------------------------------------------ subagent report */
+  pi.registerMessageRenderer("subagent-report", (message: any, { expanded, outputPad }: any, theme: any) => {
+    const d = (message.details ?? {}) as { id?: number; steps?: number; secs?: number; ok?: boolean; task?: string; report?: string };
+    const head =
+      theme.fg(d.ok ? "success" : "error", d.ok ? "✔ " : "✘ ") +
+      theme.bold(theme.fg("accent", `Subagent #${d.id}`)) +
+      theme.fg("dim", `  ·  ${d.steps ?? 0} steps  ·  ${d.secs ?? 0}s`);
+    const task = theme.fg("muted", `Task: ${(d.task ?? "").replace(/\s+/g, " ").slice(0, expanded ? 2000 : 140)}`);
+    const body = String(d.report ?? message.content ?? "");
+    const lines = body.split("\n");
+    const shown = expanded || lines.length <= 8 ? body : lines.slice(0, 8).join("\n");
+    const box = new Box(outputPad, 1, (t: string) => theme.bg("customMessageBg", t));
+    box.addChild(new Text(`${head}\n${task}`, 0, 0));
+    box.addChild(new Markdown(shown, 0, 1, getMarkdownTheme()));
+    if (!expanded && lines.length > 8) {
+      box.addChild(new Text(theme.fg("dim", `… ${lines.length - 8} more lines (ctrl+o to expand)`), 0, 0));
+    }
+    return box;
+  });
+
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
@@ -312,13 +398,7 @@ export default async function (pi: ExtensionAPI) {
       }
       const id = nextId++;
       const started = Date.now();
-      const status = () =>
-        ctx.ui.setStatus(
-          "subagent",
-          running.size
-            ? [...running].map(([n, r]) => `subagent #${n}: ${r.steps} steps, ${Math.round((Date.now() - r.started) / 1000)}s`).join(" · ")
-            : undefined,
-        );
+      const status = () => renderBar(ctx);
       const child = runChild(params.task, ctx.cwd, (steps) => {
         const r = running.get(id);
         if (r) r.steps = steps;
@@ -337,7 +417,7 @@ export default async function (pi: ExtensionAPI) {
               ? `Subagent #${id} failed after ${secs}s (${error}).\nTask: ${params.task}`
               : `Subagent #${id} report (${steps} steps, ${secs}s).\nTask: ${params.task}\n\n${report}`,
             display: true,
-            details: { id, steps, secs, ok: !error },
+            details: { id, steps, secs, ok: !error, task: params.task, report: error ?? report },
           },
           // After the current turn's tool calls, never mid-turn; answers at once if idle.
           { deliverAs: "followUp", triggerTurn: true },

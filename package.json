@@ -1,14 +1,22 @@
 {
   "name": "pi-vechkabaz",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Connects pi to ai.vechkabaz.com: models, web search and page fetch, with a one-time key prompt.",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "type": "module",
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ],
+    "themes": [
+      "./themes"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+    "typebox": "*",
+    "@earendil-works/pi-tui": "*"
   }
 }
