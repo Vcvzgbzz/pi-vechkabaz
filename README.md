@@ -22,6 +22,9 @@ replaces that entry with this one, keeps your key, and saves a backup next to th
   Limited to 60 an hour.
 - `/vechkabaz-key` to change your key later.
 
+**Screenshots:** paste with **Ctrl+V** (Cmd+V only pastes text in a terminal), or drag
+the image file onto the pi window.
+
 ## Good to know
 
 - Your key is stored in `~/.pi/agent/vechkabaz.json`, readable only by you.
