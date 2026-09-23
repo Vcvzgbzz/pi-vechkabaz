@@ -12,7 +12,7 @@ import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-a
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 const PROVIDER = "vechkabaz";
@@ -337,7 +337,9 @@ export default async function (pi: ExtensionAPI) {
             : w ? theme.fg("success", `● ${m.id} warm`)
             : theme.fg("warning", `○ ${m.id} cold (loads on next turn)`),
           );
-          if (isOrchestrator(m) && warm) {
+          // A running helper is loaded by definition; the 30 s poll can lag behind it.
+          if (isOrchestrator(m) && running.size) parts.push(theme.fg("accent", `◆ helper busy (${running.size})`));
+          else if (isOrchestrator(m) && warm) {
             parts.push(warm.has("coder-sub") ? theme.fg("success", "● helper warm") : theme.fg("dim", "○ helper cold"));
           }
         }
@@ -519,6 +521,7 @@ export default async function (pi: ExtensionAPI) {
       void child.done.then(({ report, steps, error }) => {
         running.delete(id);
         status();
+        void refreshWarm();
         const secs = Math.round((Date.now() - started) / 1000);
         pi.sendMessage(
           {
