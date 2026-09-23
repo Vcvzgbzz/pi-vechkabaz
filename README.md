@@ -27,8 +27,15 @@ replaces that entry with this one, keeps your key, and saves a backup next to th
 - `/vechkabaz-key` to change your key later.
 
 **Status line** (below the input): whether your model is warm or will load on the next
-turn, the subagent helper's state on `coder-max`, a context-window bar, and running
-subagents. Subagent reports arrive as a styled card; ctrl+o expands them.
+turn, the subagent helper's state on `coder-max`, and a context-window bar. While a cold
+model loads it counts down, based on how long that model's loads have recently taken.
+
+**Turn receipt**: a dim line after each response, e.g. `read 12.4k fresh (41k cached)
+in 13.1s · wrote 1.9k at 53.8 t/s · coder-max on B70`. Shown to you only; never sent to
+the model.
+
+**Subagents**: while helpers run, a panel above the input shows each one's last few
+actions (files read, searches). Their reports arrive as a styled card; ctrl+o expands.
 
 **Themes:** `vechkabaz-dark` and `vechkabaz-light`, in the site's colors. Pick one in
 `/settings` → theme.

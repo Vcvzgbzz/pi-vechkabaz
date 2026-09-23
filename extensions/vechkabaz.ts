@@ -12,7 +12,7 @@ import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-a
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 const PROVIDER = "vechkabaz";
@@ -68,6 +68,13 @@ function toModel(id: string, ctx?: number) {
     maxTokens: Math.min(32768, Math.floor(contextWindow / 2)),
     compat: { supportsDeveloperRole: false, supportsStore: false, maxTokensField: "max_tokens" as const },
   };
+}
+
+/** The one argument worth showing for a tool call: its path, pattern, query, URL or command. */
+function argSummary(args: any): string {
+  const v = args?.path ?? args?.file_path ?? args?.pattern ?? args?.query ?? args?.url ?? args?.command ?? "";
+  const s = String(v).replace(/\s+/g, " ");
+  return s.length > 70 ? s.slice(0, 67) + "…" : s;
 }
 
 /** A pi apiKey spec — literal, $VAR / ${VAR}, or !command — to the key itself. */
@@ -233,14 +240,14 @@ export default async function (pi: ExtensionAPI) {
   pi.on("model_select", async (e) => syncSubagent(e.model));
 
   // Background helpers, each report injected when it finishes.
-  const running = new Map<number, { kill: () => void; steps: number; started: number }>();
+  const running = new Map<number, { kill: () => void; steps: number; started: number; task: string; trail: string[] }>();
   let nextId = 1;
   pi.on("session_shutdown", async () => {
     for (const r of running.values()) r.kill();
   });
 
   /** Runs the child pi to completion; resolves with its last assistant text. */
-  const runChild = (task: string, cwd: string, onStep: (steps: number) => void) => {
+  const runChild = (task: string, cwd: string, onStep: (steps: number, tool: string, args: any) => void) => {
     const dir = mkdtempSync(join(tmpdir(), "pi-vechkabaz-sub-"));
     const promptFile = join(dir, "subagent.md");
     writeFileSync(promptFile, SUBAGENT_PROMPT, { mode: 0o600 });
@@ -270,7 +277,7 @@ export default async function (pi: ExtensionAPI) {
           } catch {
             continue;
           }
-          if (e.type === "tool_execution_start") onStep(++steps);
+          if (e.type === "tool_execution_start") onStep(++steps, e.toolName, e.args);
           if (e.type === "message_end" && e.message?.role === "assistant") {
             const text = (e.message.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
             if (text.trim()) report = text;
@@ -294,6 +301,11 @@ export default async function (pi: ExtensionAPI) {
    * orchestrator), a context bar, and running subagents. */
   let warm: Set<string> | undefined;
   let barCtx: any;
+  /** Observed cold-load seconds per model, from /api/v1/models. */
+  const loadS = new Map<string, number>();
+  /** A model call that has not produced output yet: drives the countdown. */
+  let waiting: { since: number; cold: boolean; eta: number | null } | undefined;
+  let responseStart = 0;
   const renderBar = (ctx?: any) => {
     if (ctx) barCtx = ctx;
     const c = barCtx;
@@ -303,7 +315,22 @@ export default async function (pi: ExtensionAPI) {
       (_tui: unknown, theme: any) => {
         const parts: string[] = [];
         const m = c.model;
-        if (m?.provider === PROVIDER) {
+        const waitS = waiting ? Math.round((Date.now() - waiting.since) / 1000) : 0;
+        if (m?.provider === PROVIDER && waiting && (waiting.cold || waitS >= 3)) {
+          if (waiting.cold && waiting.eta) {
+            const frac = Math.min(1, waitS / waiting.eta);
+            const f = Math.round(frac * 8);
+            const left = waiting.eta - waitS;
+            parts.push(
+              theme.fg("warning", `○ ${m.id} loading `) + theme.fg("warning", "▰".repeat(f)) + theme.fg("borderMuted", "▱".repeat(8 - f)) +
+              theme.fg("dim", left > 0 ? ` ~${left}s left` : ` ${waitS}s, longer than usual`),
+            );
+          } else if (waiting.cold) {
+            parts.push(theme.fg("warning", `○ ${m.id} loading `) + theme.fg("dim", `${waitS}s`));
+          } else {
+            parts.push(theme.fg("dim", `… waiting for the GPU · ${waitS}s`));
+          }
+        } else if (m?.provider === PROVIDER) {
           const w = warm?.has(m.id);
           parts.push(
             w === undefined ? theme.fg("dim", `◌ ${m.id}`)
@@ -321,18 +348,36 @@ export default async function (pi: ExtensionAPI) {
           const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`);
           parts.push(`${theme.fg("muted", "ctx ")}${theme.fg(color, "▰".repeat(filled))}${theme.fg("borderMuted", "▱".repeat(10 - filled))} ${theme.fg(color, `${Math.round(u.percent)}%`)} ${theme.fg("dim", `${k(u.tokens)}/${k(u.contextWindow)}`)}`);
         }
-        for (const [n, r] of running) {
-          parts.push(theme.fg("accent", `◆ subagent #${n} `) + theme.fg("dim", `${r.steps} steps · ${Math.round((Date.now() - r.started) / 1000)}s`));
-        }
         return new Text(parts.join(theme.fg("borderMuted", "  │  ")), 0, 0);
       },
       { placement: "belowEditor" },
+    );
+    // Live trail of each running helper, above the editor; gone when none run.
+    c.ui.setWidget(
+      "vechkabaz-sub",
+      running.size
+        ? (_tui: unknown, theme: any) => {
+            const lines: string[] = [];
+            for (const [n, r] of running) {
+              const task = r.task.replace(/\s+/g, " ");
+              lines.push(
+                theme.fg("accent", `◆ subagent #${n}  `) +
+                  theme.fg("dim", `${task.length > 60 ? task.slice(0, 57) + "…" : task} · ${r.steps} steps · ${Math.round((Date.now() - r.started) / 1000)}s`),
+              );
+              r.trail.forEach((t, i) =>
+                lines.push(theme.fg("dim", i === r.trail.length - 1 ? "  └ " : "  ├ ") + (i === r.trail.length - 1 ? theme.fg("accent", t) : theme.fg("muted", t))),
+              );
+            }
+            return new Text(lines.join("\n"), 0, 0);
+          }
+        : undefined,
     );
   };
   const refreshWarm = async () => {
     try {
       const r = await api("/models", resolveKey(spec), AbortSignal.timeout(8_000));
       warm = Array.isArray(r.warm) ? new Set(r.warm) : undefined;
+      for (const m of r.data ?? []) if (typeof m.load_s === "number") loadS.set(m.id, m.load_s);
     } catch {
       warm = undefined;
     }
@@ -344,15 +389,77 @@ export default async function (pi: ExtensionAPI) {
       void refreshWarm();
     });
     pi.on("model_select", async (_e, ctx) => renderBar(ctx));
-    pi.on("turn_end", async (_e, ctx) => renderBar(ctx));
+    pi.on("agent_start", async () => {
+      responseStart = Date.now();
+    });
+    pi.on("turn_start", async (_e, ctx) => {
+      const id = ctx.model?.provider === PROVIDER ? ctx.model.id : undefined;
+      waiting = id ? { since: Date.now(), cold: warm ? !warm.has(id) : false, eta: loadS.get(id) ?? null } : undefined;
+      renderBar(ctx);
+    });
+    pi.on("message_update", async (_e, ctx) => {
+      if (!waiting) return;
+      waiting = undefined;
+      renderBar(ctx);
+    });
+    pi.on("turn_end", async (_e, ctx) => {
+      waiting = undefined;
+      renderBar(ctx);
+    });
     pi.on("agent_end", async (_e, ctx) => {
+      waiting = undefined;
       renderBar(ctx);
       void refreshWarm();
+      void receipt(ctx);
     });
     setInterval(() => void refreshWarm(), 30_000).unref();
-    // Keeps elapsed seconds moving while helpers run.
-    setInterval(() => running.size && renderBar(), 1_000).unref();
+    // Keeps elapsed seconds moving while helpers run or a call waits.
+    setInterval(() => (running.size || waiting) && renderBar(), 1_000).unref();
   }
+
+  /* ------------------------------------------------------------ turn receipt
+   * One dim line after each response, summing its model calls. appendEntry keeps
+   * it out of the model's context. */
+  const receipt = async (ctx: any) => {
+    const m = ctx.model;
+    if (m?.provider !== PROVIDER || !responseStart) return;
+    try {
+      const r = await api(`/turns?since=${responseStart - 1000}&model=${encodeURIComponent(m.id)}`, resolveKey(spec), AbortSignal.timeout(8_000));
+      const turns: any[] = r.turns ?? [];
+      if (!turns.length) return;
+      const sum = (k: string) => turns.reduce((n, t) => n + (typeof t[k] === "number" ? t[k] : 0), 0);
+      const decodeMs = turns.reduce((n, t) => n + (t.tps && t.predictedN ? (t.predictedN / t.tps) * 1000 : 0), 0);
+      const devices = [...new Set(turns.map((t) => (t.device ?? "peer").toUpperCase()))];
+      pi.appendEntry("vechkabaz-receipt", {
+        calls: turns.length,
+        fresh: sum("promptN"),
+        cached: Math.max(0, ...turns.map((t) => t.cacheN ?? 0)),
+        prefillS: sum("promptMs") / 1000,
+        wrote: sum("predictedN"),
+        tps: decodeMs ? sum("predictedN") / (decodeMs / 1000) : null,
+        loadS: sum("loadMs") / 1000,
+        queuedS: sum("queuedMs") / 1000,
+        wh: turns.some((t) => typeof t.wh === "number") ? sum("wh") : null,
+        where: `${m.id} on ${devices.join("+")}`,
+      });
+    } catch {
+      // A missing receipt is not worth an error line.
+    }
+  };
+  pi.registerEntryRenderer("vechkabaz-receipt", (entry: any, _opts: any, theme: any) => {
+    const d = entry.data ?? {};
+    const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n)}`);
+    const bits = [
+      d.calls > 1 ? `${d.calls} calls` : null,
+      `read ${k(d.fresh)} fresh (${k(d.cached)} cached) in ${d.prefillS.toFixed(1)}s`,
+      d.tps ? `wrote ${k(d.wrote)} at ${d.tps.toFixed(1)} t/s` : `wrote ${k(d.wrote)}`,
+      d.loadS >= 1 ? `loaded ${Math.round(d.loadS)}s` : null,
+      d.queuedS >= 1 ? `queued ${Math.round(d.queuedS)}s` : null,
+      d.where,
+      typeof d.wh === "number" ? `${d.wh.toFixed(2)} Wh` : null,
+    ].filter(Boolean);
+    return new Text(theme.fg("dim", `↳ ${bits.join(" · ")}`), 1, 0);
+  });
 
   /* ------------------------------------------------------------ subagent report */
   pi.registerMessageRenderer("subagent-report", (message: any, { expanded, outputPad }: any, theme: any) => {
@@ -399,12 +506,15 @@ export default async function (pi: ExtensionAPI) {
       const id = nextId++;
       const started = Date.now();
       const status = () => renderBar(ctx);
-      const child = runChild(params.task, ctx.cwd, (steps) => {
+      const child = runChild(params.task, ctx.cwd, (steps, tool, args) => {
         const r = running.get(id);
-        if (r) r.steps = steps;
+        if (r) {
+          r.steps = steps;
+          r.trail = [...r.trail, `${tool.padEnd(11)}${argSummary(args)}`].slice(-4);
+        }
         status();
       });
-      running.set(id, { kill: child.kill, steps: 0, started });
+      running.set(id, { kill: child.kill, steps: 0, started, task: params.task, trail: [] });
       status();
       void child.done.then(({ report, steps, error }) => {
         running.delete(id);
