@@ -12,14 +12,14 @@ import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-a
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const VERSION = "0.5.2";
-const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
+const VERSION = "0.6.0";
+export const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 const PROVIDER = "vechkabaz";
 const DEFAULT_MODEL = "coder-max";
-const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-const KEY_FILE = join(AGENT_DIR, "vechkabaz.json");
-const HEADERS = { "User-Agent": `pi-vechkabaz/${VERSION}` };
+export const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+export const KEY_FILE = join(AGENT_DIR, "vechkabaz.json");
+export const HEADERS = { "User-Agent": `pi-vechkabaz/${VERSION}` };
 // The server pins this id to the second GPU, so a subagent never evicts the parent's model.
 const SUBAGENT_MODEL = `${PROVIDER}/coder-sub`;
 // Only this parent model gets the subagent tool; everything else never sees it.
@@ -78,14 +78,14 @@ function argSummary(args: any): string {
 }
 
 /** A pi apiKey spec — literal, $VAR / ${VAR}, or !command — to the key itself. */
-function resolveKey(spec: string | undefined): string | undefined {
+export function resolveKey(spec: string | undefined): string | undefined {
   if (!spec) return process.env.VECHKABAZ_API_KEY;
   if (spec.startsWith("!")) return execSync(spec.slice(1), { encoding: "utf8", shell: "/bin/sh" }).trim() || undefined;
   const env = /^\$\{?(\w+)\}?$/.exec(spec);
   return env ? process.env[env[1]!] : spec;
 }
 
-function readJson(path: string): Record<string, any> | undefined {
+export function readJson(path: string): Record<string, any> | undefined {
   if (!existsSync(path)) return undefined;
   return JSON.parse(readFileSync(path, "utf8"));
 }
@@ -244,6 +244,8 @@ export default async function (pi: ExtensionAPI) {
   let nextId = 1;
   pi.on("session_shutdown", async () => {
     for (const r of running.values()) r.kill();
+    // The ctx is stale once the session ends; a late warm-state refresh must not touch it.
+    barCtx = undefined;
   });
 
   /** Runs the child pi to completion; resolves with its last assistant text. */
