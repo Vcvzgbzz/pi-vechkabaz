@@ -1,8 +1,8 @@
 /**
- * Persistent memory: small markdown notes under ~/.pi/agent/vechkabaz-memory, global or per
- * project. The index is read once per session and frozen, so the prompt prefix (and the
- * server's KV cache) never changes mid-session. Subagents load only vechkabaz.ts, so they
- * never see this file.
+ * Persistent memory: small markdown notes, global or per project, kept on ai.vechkabaz.com
+ * (default) or in ~/.pi/agent/vechkabaz-memory (`/memory local`). The index is read once per
+ * session and frozen, so the prompt prefix (and the server's KV cache) never changes
+ * mid-session. Subagents load only vechkabaz.ts, so they never see this file.
  */
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -11,9 +11,10 @@ import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { AGENT_DIR, BASE, KEY_FILE, readJson, resolveKey } from "./vechkabaz.ts";
+import { AGENT_DIR, BASE, HEADERS, KEY_FILE, readJson, resolveKey } from "./vechkabaz.ts";
 
 const ROOT = join(AGENT_DIR, "vechkabaz-memory");
+const CONFIG = join(ROOT, "config.json");
 const STATUS = "_status";
 const NAME = /^[a-z0-9][a-z0-9-]{0,63}$|^_status$/;
 const MAX_BODY = 4096;
@@ -26,7 +27,8 @@ const SECRET = /(hl_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]
 
 type Scope = "global" | "project";
 type Provenance = "user" | "agent" | "web";
-interface Note { scope: Scope; name: string; description: string; provenance: Provenance; created: string; updated: string; used: string; body: string }
+type Mode = "cloud" | "local";
+interface Note { scope: Scope; project: string; name: string; description: string; provenance: Provenance; created: number; updated: number; used: number; body: string }
 
 /** A stable id for the project: the git remote if there is one, else the folder. */
 export function projectKey(cwd: string): string {
@@ -36,46 +38,58 @@ export function projectKey(cwd: string): string {
   } catch {
     // Not a git repo, or no origin.
   }
-  const slug = basename(id).replace(/\.git$/, "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 40) || "project";
+  const slug = basename(id).replace(/\.git$/, "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+/, "").slice(0, 40) || "project";
   return `${slug}-${createHash("sha1").update(id).digest("hex").slice(0, 8)}`;
+}
+
+const mode = (): Mode => (readJson(CONFIG)?.mode === "local" ? "local" : "cloud");
+function setMode(m: Mode) {
+  mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+  writeFileSync(CONFIG, JSON.stringify({ ...(readJson(CONFIG) ?? {}), mode: m }, null, 2) + "\n", { mode: 0o600 });
 }
 
 /* ------------------------------------------------------------ local store */
 
 const dirOf = (scope: Scope, project: string) => (scope === "global" ? join(ROOT, "global") : join(ROOT, "projects", project));
+const iso = (ms: number) => new Date(ms).toISOString();
 
-function parse(scope: Scope, name: string, text: string): Note {
+function parse(scope: Scope, project: string, name: string, text: string): Note {
   const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text);
   const meta: Record<string, string> = {};
   for (const line of (m?.[1] ?? "").split("\n")) {
     const i = line.indexOf(":");
     if (i > 0) meta[line.slice(0, i).trim()] = line.slice(i + 1).trim();
   }
-  const now = new Date().toISOString();
+  const at = (v: string | undefined) => (v && !Number.isNaN(Date.parse(v)) ? Date.parse(v) : Date.now());
   return {
-    scope, name,
+    scope, project, name,
     description: meta.description ?? name,
     provenance: (["user", "agent", "web"].includes(meta.provenance) ? meta.provenance : "agent") as Provenance,
-    created: meta.created ?? now, updated: meta.updated ?? now, used: meta.used ?? meta.updated ?? now,
+    created: at(meta.created), updated: at(meta.updated), used: at(meta.used ?? meta.updated),
     body: (m ? m[2] : text).trim(),
   };
 }
 
 const render = (n: Note) =>
-  `---\ndescription: ${n.description.replace(/\n/g, " ")}\nprovenance: ${n.provenance}\ncreated: ${n.created}\nupdated: ${n.updated}\nused: ${n.used}\n---\n${n.body}\n`;
+  `---\ndescription: ${n.description.replace(/\n/g, " ")}\nprovenance: ${n.provenance}\ncreated: ${iso(n.created)}\nupdated: ${iso(n.updated)}\nused: ${iso(n.used)}\n---\n${n.body}\n`;
 
-export const local = {
+const localStore = {
   list(scope: Scope, project: string): Note[] {
     const dir = dirOf(scope, project);
     if (!existsSync(dir)) return [];
-    return readdirSync(dir).filter((f) => f.endsWith(".md")).map((f) => parse(scope, f.slice(0, -3), readFileSync(join(dir, f), "utf8")));
+    return readdirSync(dir).filter((f) => f.endsWith(".md")).map((f) => parse(scope, project, f.slice(0, -3), readFileSync(join(dir, f), "utf8")));
+  },
+  /** Every local note, every project. */
+  all(): Note[] {
+    const projects = existsSync(join(ROOT, "projects")) ? readdirSync(join(ROOT, "projects")) : [];
+    return [...localStore.list("global", ""), ...projects.flatMap((p) => localStore.list("project", p))];
   },
   get(scope: Scope, project: string, name: string): Note | undefined {
     const f = join(dirOf(scope, project), `${name}.md`);
-    return existsSync(f) ? parse(scope, name, readFileSync(f, "utf8")) : undefined;
+    return existsSync(f) ? parse(scope, project, name, readFileSync(f, "utf8")) : undefined;
   },
-  put(n: Note, project: string): void {
-    const dir = dirOf(n.scope, project);
+  put(n: Note): void {
+    const dir = dirOf(n.scope, n.project);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const f = join(dir, `${n.name}.md`);
     writeFileSync(`${f}.tmp`, render(n), { mode: 0o600 });
@@ -88,18 +102,91 @@ export const local = {
     return true;
   },
   /** Drops project notes nobody has read in EXPIRE_MS. */
-  expire(): number {
-    const base = join(ROOT, "projects");
-    if (!existsSync(base)) return 0;
-    let n = 0;
-    for (const p of readdirSync(base)) {
-      for (const note of local.list("project", p)) {
-        if (Date.now() - Date.parse(note.used) > EXPIRE_MS && local.remove("project", p, note.name)) n++;
-      }
+  expire(): void {
+    for (const n of localStore.all()) {
+      if (n.scope === "project" && Date.now() - n.used > EXPIRE_MS) localStore.remove("project", n.project, n.name);
     }
-    return n;
+  },
+  /** Moves every local note aside after an upload, so nothing is lost if the server loses it. */
+  archive(): string {
+    const dest = join(ROOT, `uploaded-${new Date().toISOString().slice(0, 19).replace(/:/g, "")}`);
+    mkdirSync(dest, { recursive: true, mode: 0o700 });
+    for (const d of ["global", "projects"]) if (existsSync(join(ROOT, d))) renameSync(join(ROOT, d), join(dest, d));
+    return dest;
   },
 };
+
+/* ------------------------------------------------------------ cloud store */
+
+async function cloud(method: string, path: string, body?: unknown): Promise<any> {
+  const key = resolveKey(readJson(KEY_FILE)?.apiKey);
+  if (!key) throw new Error("no API key yet: run /vechkabaz-key");
+  const res = await fetch(`${BASE}/memory${path}`, {
+    method,
+    headers: { ...HEADERS, Authorization: `Bearer ${key}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(15_000),
+  });
+  const out = await res.json().catch(() => ({}));
+  if (res.status === 404 && method === "GET") return undefined;
+  if (!res.ok) throw new Error(out?.error?.message ?? `HTTP ${res.status}`);
+  return out;
+}
+const fromCloud = (n: any): Note => ({
+  scope: n.scope, project: n.project ?? "", name: n.name, description: n.description, provenance: n.provenance,
+  created: n.created, updated: n.updated, used: n.used, body: n.body,
+});
+const where = (scope: Scope, project: string, name: string) =>
+  `/${scope}/${name}${scope === "project" ? `?project=${encodeURIComponent(project)}` : ""}`;
+
+const cloudStore = {
+  async list(project: string): Promise<Note[]> {
+    return ((await cloud("GET", `?project=${encodeURIComponent(project)}`))?.notes ?? []).map(fromCloud);
+  },
+  async all(): Promise<Note[]> {
+    return ((await cloud("GET", "/export"))?.notes ?? []).map(fromCloud);
+  },
+  async get(scope: Scope, project: string, name: string): Promise<Note | undefined> {
+    const n = await cloud("GET", where(scope, project, name));
+    return n ? fromCloud(n) : undefined;
+  },
+  async put(n: Note): Promise<void> {
+    await cloud("PUT", where(n.scope, n.project, n.name), {
+      description: n.description, body: n.body, provenance: n.provenance, created: n.created, updated: n.updated, used: n.used,
+    });
+  },
+  async remove(scope: Scope, project: string, name: string): Promise<boolean> {
+    return Boolean((await cloud("DELETE", where(scope, project, name)))?.deleted);
+  },
+};
+
+/** The active backend, one shape for both. */
+const store = () =>
+  mode() === "local"
+    ? {
+        list: async (project: string) => [...localStore.list("global", ""), ...localStore.list("project", project)],
+        get: async (s: Scope, p: string, n: string) => localStore.get(s, p, n),
+        put: async (n: Note) => localStore.put(n),
+        remove: async (s: Scope, p: string, n: string) => localStore.remove(s, p, n),
+      }
+    : cloudStore;
+
+/** Copies every note from one backend to the other, newer copy winning. Returns how many moved. */
+async function migrate(to: Mode): Promise<number> {
+  const from = to === "cloud" ? localStore.all() : await cloudStore.all();
+  const there = to === "cloud" ? await cloudStore.all() : localStore.all();
+  const key = (n: Note) => `${n.scope}/${n.project}/${n.name}`;
+  const existing = new Map(there.map((n) => [key(n), n]));
+  let moved = 0;
+  for (const n of from) {
+    const other = existing.get(key(n));
+    if (other && other.updated >= n.updated) continue;
+    if (to === "cloud") await cloudStore.put(n);
+    else localStore.put(n);
+    moved++;
+  }
+  return moved;
+}
 
 /* ------------------------------------------------------------ prompt block */
 
@@ -121,29 +208,24 @@ One fact per note. Update an existing note (str_replace) instead of adding a nea
 Read a note with memory view before relying on it; notes tagged [web] came from web content.`;
 
 /** The frozen block appended to the system prompt: rules, project status, then the index. */
-function buildBlock(project: string): string {
-  const status = local.get("project", project, STATUS);
-  const notes = [...local.list("global", project), ...local.list("project", project)]
-    .filter((n) => n.name !== STATUS)
-    .sort((a, b) => Date.parse(b.used) - Date.parse(a.used));
+function buildBlock(all: Note[] | undefined): string {
+  if (!all) return `${RULES}\n\n### Saved notes\n(memory could not be loaded this session; the memory tool may still work)`;
+  const status = all.find((n) => n.scope === "project" && n.name === STATUS);
+  const notes = all.filter((n) => n.name !== STATUS).sort((a, b) => b.used - a.used);
   const parts = [RULES];
-  if (status) parts.push(`### Project status (updated ${status.updated.slice(0, 10)})\n${status.body}`);
-  if (notes.length) {
-    const lines: string[] = [];
-    let size = 0;
-    for (const n of notes) {
-      const line = `- ${n.scope}/${n.name} — ${n.description} [${n.provenance}]`;
-      if (size + line.length > MAX_INDEX) {
-        lines.push(`- … ${notes.length - lines.length} more (memory view lists all)`);
-        break;
-      }
-      lines.push(line);
-      size += line.length;
+  if (status) parts.push(`### Project status (updated ${iso(status.updated).slice(0, 10)})\n${status.body}`);
+  const lines: string[] = [];
+  let size = 0;
+  for (const n of notes) {
+    const line = `- ${n.scope}/${n.name} — ${n.description} [${n.provenance}]`;
+    if (size + line.length > MAX_INDEX) {
+      lines.push(`- … ${notes.length - lines.length} more (memory view lists all)`);
+      break;
     }
-    parts.push(`### Saved notes\n${lines.join("\n")}`);
-  } else {
-    parts.push("### Saved notes\n(none yet)");
+    lines.push(line);
+    size += line.length;
   }
+  parts.push(`### Saved notes\n${lines.length ? lines.join("\n") : "(none yet)"}`);
   return parts.join("\n\n");
 }
 
@@ -156,18 +238,31 @@ export default function (pi: ExtensionAPI) {
   let userAsked = false;
   let userTurns = 0;
 
-  const start = (cwd: string) => {
-    project = projectKey(cwd);
-    local.expire();
-    block = buildBlock(project);
-    userTurns = 0;
-  };
-
   pi.on("session_start", async (_e, ctx) => {
-    start(ctx.cwd);
-    const status = local.get("project", project, STATUS);
-    const goal = /\*\*Current goal:\*\*\s*(.+)/.exec(status?.body ?? "")?.[1]?.replace(/[*_`]/g, "").trim();
-    if (goal && ctx.hasUI) ctx.ui.notify(`Last time: ${goal.slice(0, 160)}`, "info");
+    project = projectKey(ctx.cwd);
+    userTurns = 0;
+    const say = (m: string) => ctx.hasUI && ctx.ui.notify(m, "info");
+    localStore.expire();
+    // First run in cloud mode with local notes: upload them, then keep the files as a backup.
+    if (mode() === "cloud" && localStore.all().length) {
+      try {
+        const n = await migrate("cloud");
+        say(`Memory now lives on ${new URL(BASE).host}: uploaded ${n} note(s). Local copies kept in ${localStore.archive()}. /memory local switches back.`);
+      } catch (e) {
+        say(`Memory: couldn't upload local notes yet (${(e as Error).message}); using them locally this session.`);
+      }
+    }
+    let all: Note[] | undefined;
+    try {
+      all = mode() === "cloud" && localStore.all().length === 0
+        ? await cloudStore.list(project)
+        : [...localStore.list("global", ""), ...localStore.list("project", project)];
+    } catch (e) {
+      say(`Memory unavailable this session: ${(e as Error).message}`);
+    }
+    block = buildBlock(all);
+    const goal = /\*\*Current goal:\*\*\s*(.+)/.exec(all?.find((n) => n.name === STATUS)?.body ?? "")?.[1]?.replace(/[*_`]/g, "").trim();
+    if (goal) say(`Last time: ${goal.slice(0, 160)}`);
   });
 
   // Same bytes every turn: a changing system prompt would make the server re-read the whole conversation.
@@ -195,6 +290,8 @@ export default function (pi: ExtensionAPI) {
         VECHKABAZ_KEY: key,
         VECHKABAZ_BASE: BASE,
         SESSION_FILE: session,
+        MEMORY_MODE: mode(),
+        PROJECT_KEY: project,
         STATUS_FILE: join(dirOf("project", project), `${STATUS}.md`),
         PROJECT_DIR: ctx.cwd,
       },
@@ -213,6 +310,7 @@ export default function (pi: ExtensionAPI) {
     return { scope: m[1] as Scope, name: m[2]! };
   };
   const reply = (text: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text }], details });
+  const listing = (notes: Note[]) => notes.map((n) => `${n.scope}/${n.name} — ${n.description} [${n.provenance}]`).join("\n");
 
   pi.registerTool({
     name: "memory",
@@ -229,69 +327,85 @@ export default function (pi: ExtensionAPI) {
       new_str: Type.Optional(Type.String({ description: "For str_replace: replacement text" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      if (params.command === "view" && !params.path) {
-        const notes = [...local.list("global", project), ...local.list("project", project)];
-        return reply(notes.length ? notes.map((n) => `${n.scope}/${n.name} — ${n.description} [${n.provenance}]`).join("\n") : "No notes saved yet.");
-      }
-      const p = parsePath(params.path);
-      if (typeof p === "string") return reply(p);
-      const existing = local.get(p.scope, project, p.name);
-      const now = new Date().toISOString();
+      try {
+        const s = store();
+        if (params.command === "view" && !params.path) {
+          const notes = await s.list(project);
+          return reply(notes.length ? listing(notes) : "No notes saved yet.");
+        }
+        const p = parsePath(params.path);
+        if (typeof p === "string") return reply(p);
+        const existing = await s.get(p.scope, project, p.name);
+        const now = Date.now();
 
-      if (params.command === "view") {
-        if (!existing) return reply(`No note at ${params.path}.`);
-        local.put({ ...existing, used: now }, project);
-        return reply(`${existing.description} [${existing.provenance}, updated ${existing.updated.slice(0, 10)}]\n\n${existing.body}`);
-      }
-      if (params.command === "delete") {
-        const ok = local.remove(p.scope, project, p.name);
-        if (ok && ctx.hasUI) ctx.ui.notify(`memory deleted: ${params.path}`, "info");
-        return reply(ok ? `Deleted ${params.path}.` : `No note at ${params.path}.`);
-      }
+        if (params.command === "view") {
+          if (!existing) return reply(`No note at ${params.path}.`);
+          if (mode() === "local") localStore.put({ ...existing, used: now }); // the server marks its own on read
+          return reply(`${existing.description} [${existing.provenance}, updated ${iso(existing.updated).slice(0, 10)}]\n\n${existing.body}`);
+        }
+        if (params.command === "delete") {
+          const ok = await s.remove(p.scope, project, p.name);
+          if (ok && ctx.hasUI) ctx.ui.notify(`memory deleted: ${params.path}`, "info");
+          return reply(ok ? `Deleted ${params.path}.` : `No note at ${params.path}.`);
+        }
 
-      let body: string;
-      if (params.command === "create") {
-        if (existing) return reply(`${params.path} already exists; use str_replace to change it or delete it first.`);
-        if (!params.content?.trim() || !params.description?.trim()) return reply("create needs both description and content.");
-        body = params.content.trim();
-      } else {
-        if (!existing) return reply(`No note at ${params.path}.`);
-        if (params.old_str === undefined || params.new_str === undefined) return reply("str_replace needs old_str and new_str.");
-        const count = existing.body.split(params.old_str).length - 1;
-        if (count !== 1) return reply(`old_str must appear exactly once in the note (found ${count}).`);
-        body = existing.body.replace(params.old_str, () => params.new_str!);
-      }
-      const description = (params.description ?? existing?.description ?? "").trim();
-      if (body.length > MAX_BODY) return reply(`Note is ${body.length} characters; keep it under ${MAX_BODY}.`);
-      if (description.length > MAX_DESC) return reply(`Description is ${description.length} characters; keep it under ${MAX_DESC}.`);
-      if (SECRET.test(body) || SECRET.test(description)) return reply("That looks like a credential. Secrets are never saved to memory.");
+        let body: string;
+        if (params.command === "create") {
+          if (existing) return reply(`${params.path} already exists; use str_replace to change it or delete it first.`);
+          if (!params.content?.trim() || !params.description?.trim()) return reply("create needs both description and content.");
+          body = params.content.trim();
+        } else {
+          if (!existing) return reply(`No note at ${params.path}.`);
+          if (params.old_str === undefined || params.new_str === undefined) return reply("str_replace needs old_str and new_str.");
+          const count = existing.body.split(params.old_str).length - 1;
+          if (count !== 1) return reply(`old_str must appear exactly once in the note (found ${count}).`);
+          body = existing.body.replace(params.old_str, () => params.new_str!);
+        }
+        const description = (params.description ?? existing?.description ?? "").trim();
+        if (body.length > MAX_BODY) return reply(`Note is ${body.length} characters; keep it under ${MAX_BODY}.`);
+        if (description.length > MAX_DESC) return reply(`Description is ${description.length} characters; keep it under ${MAX_DESC}.`);
+        if (SECRET.test(body) || SECRET.test(description)) return reply("That looks like a credential. Secrets are never saved to memory.");
 
-      // Web content is the main way a malicious instruction gets into memory, so a person confirms it.
-      const provenance: Provenance = webThisRun ? "web" : userAsked ? "user" : "agent";
-      if (provenance === "web") {
-        if (!ctx.hasUI) return reply("Not saved: this turn read web content, and saving it needs the user's confirmation.");
-        const ok = await ctx.ui.confirm("Save to memory?", `${params.path}: ${description}\n\nThis turn read web content. Save this note?`);
-        if (!ok) return reply("The user declined to save this note.");
+        // Web content is the main way a malicious instruction gets into memory, so a person confirms it.
+        const provenance: Provenance = webThisRun ? "web" : userAsked ? "user" : "agent";
+        if (provenance === "web") {
+          if (!ctx.hasUI) return reply("Not saved: this turn read web content, and saving it needs the user's confirmation.");
+          const ok = await ctx.ui.confirm("Save to memory?", `${params.path}: ${description}\n\nThis turn read web content. Save this note?`);
+          if (!ok) return reply("The user declined to save this note.");
+        }
+        await s.put({ scope: p.scope, project: p.scope === "project" ? project : "", name: p.name, description, provenance, body, created: existing?.created ?? now, updated: now, used: now });
+        if (ctx.hasUI) ctx.ui.notify(`memory saved: ${params.path}`, "info");
+        return reply(`Saved ${params.path}. It appears in the index from the next session.`);
+      } catch (e) {
+        return reply(`memory failed: ${(e as Error).message}`);
       }
-      local.put({ scope: p.scope, name: p.name, description, provenance, body, created: existing?.created ?? now, updated: now, used: now }, project);
-      if (ctx.hasUI) ctx.ui.notify(`memory saved: ${params.path}`, "info");
-      return reply(`Saved ${params.path}. It appears in the index from the next session.`);
     },
   });
 
   pi.registerCommand("memory", {
-    description: "List saved memory notes for this project and globally",
+    description: "List saved memory notes; /memory local or /memory cloud moves them",
     handler: async (args, ctx) => {
-      if (/^(cloud|local)\b/.test(String(args ?? "").trim())) {
-        return ctx.ui.notify("Memory is stored locally for now; cloud storage arrives in a later version.", "info");
+      const want = String(args ?? "").trim();
+      try {
+        if (want === "local" || want === "cloud") {
+          if (mode() === want) return ctx.ui.notify(`Memory is already ${want}.`, "info");
+          if (want === "local") {
+            const n = await migrate("local");
+            for (const note of await cloudStore.all()) await cloudStore.remove(note.scope, note.project, note.name);
+            setMode("local");
+            return ctx.ui.notify(`Memory is now local (${ROOT}): downloaded ${n} note(s) and removed them from the server.`, "info");
+          }
+          const n = await migrate("cloud");
+          const kept = localStore.all().length ? ` Local copies kept in ${localStore.archive()}.` : "";
+          setMode("cloud");
+          return ctx.ui.notify(`Memory now lives on ${new URL(BASE).host}: uploaded ${n} note(s).${kept}`, "info");
+        }
+        const notes = await store().list(project);
+        const whereTo = mode() === "cloud" ? new URL(BASE).host : ROOT;
+        ctx.ui.notify(notes.length ? `Memory (${mode()}, ${whereTo}):\n${listing(notes).replace(/^/gm, "  ")}` : `No memory saved yet (${mode()}, ${whereTo}).`, "info");
+      } catch (e) {
+        ctx.ui.notify(`memory: ${(e as Error).message}`, "error");
       }
-      const notes = [...local.list("global", project), ...local.list("project", project)];
-      ctx.ui.notify(
-        notes.length
-          ? `Memory (local, ${ROOT}):\n${notes.map((n) => `  ${n.scope}/${n.name} — ${n.description} [${n.provenance}]`).join("\n")}`
-          : `No memory saved yet (${ROOT}).`,
-        "info",
-      );
     },
   });
 
@@ -308,8 +422,11 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const p = parsePath(String(args ?? "").trim());
       if (typeof p === "string") return ctx.ui.notify(p, "warning");
-      ctx.ui.notify(local.remove(p.scope, project, p.name) ? `Deleted ${args}.` : `No note at ${args}.`, "info");
+      try {
+        ctx.ui.notify((await store().remove(p.scope, project, p.name)) ? `Deleted ${args}.` : `No note at ${args}.`, "info");
+      } catch (e) {
+        ctx.ui.notify(`memory: ${(e as Error).message}`, "error");
+      }
     },
   });
 }
-

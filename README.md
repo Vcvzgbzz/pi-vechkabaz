@@ -26,16 +26,20 @@ replaces that entry with this one, keeps your key, and saves a backup next to th
   files or run commands.
 - `/vechkabaz-key` to change your key later.
 
-**Memory**: pi remembers things between sessions, as small notes stored on your machine in
-`~/.pi/agent/vechkabaz-memory/`, either global (about you) or per project.
+**Memory**: pi remembers things between sessions, as small notes that are either global
+(about you) or per project. They're stored on ai.vechkabaz.com under your account, so they
+follow you to any machine; `/memory local` keeps them in `~/.pi/agent/vechkabaz-memory/`
+on this machine instead, and `/memory cloud` moves them back.
 
 - It saves when you ask ("remember that we deploy with `make ship`", or `/remember …`),
   when you correct it, when you state a preference, and when it works out something
   non-obvious about the project. Every save shows a `memory saved: …` line.
 - At the end of each session it updates a short status note for the project (goal, what
   was done, next steps), so the next session picks up where you left off.
-- `/memory` lists what's saved; `/forget project/<name>` deletes a note. The notes are plain
-  markdown files you can read, edit or delete yourself.
+- `/memory` lists what's saved; `/forget project/<name>` deletes a note. In local mode the
+  notes are plain markdown files you can read, edit or delete yourself.
+- Notes you already had locally are uploaded the first time you start this version; the
+  files are kept as a backup next to them.
 - If a turn read web content, pi asks before saving anything from it.
 
 **Status line** (below the input): whether your model is warm or will load on the next
@@ -60,6 +64,6 @@ the image file onto the pi window.
 - Your key is stored in `~/.pi/agent/vechkabaz.json`, readable only by you.
 - Every request made with your key is logged by the server, including each search and
   each page fetched.
-- Memory notes stay on your machine; they reach the server only as part of your prompts,
-  like the rest of your conversation.
+- Memory notes are stored on the server with your account (up to 200 notes) and can be read
+  by the server's admins, like your chats. Use `/memory local` to keep them on your machine.
 - `VECHKABAZ_URL` points the extension at a different deployment.
