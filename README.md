@@ -34,6 +34,9 @@ on this machine instead, and `/memory cloud` moves them back.
 - It saves when you ask ("remember that we deploy with `make ship`", or `/remember …`),
   when you correct it, when you state a preference, and when it works out something
   non-obvious about the project. Every save shows a `memory saved: …` line.
+- Before each message, notes relevant to it are recalled automatically and shown to the
+  model in full; you see a `↳ recalled …` line when that happens. Short replies and
+  unrelated questions recall nothing. (Cloud mode only: the search runs on the server.)
 - At the end of each session it updates a short status note for the project (goal, what
   was done, next steps), so the next session picks up where you left off.
 - `/memory` lists what's saved; `/forget project/<name>` deletes a note. In local mode the
