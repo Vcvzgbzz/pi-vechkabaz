@@ -166,8 +166,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_e, ctx) => {
     start(ctx.cwd);
     const status = local.get("project", project, STATUS);
-    const goal = status?.body.split("\n").find((l) => l.trim() && !l.startsWith("#"));
-    if (goal && ctx.hasUI) ctx.ui.notify(`Last time: ${goal.replace(/^[-*]\s*/, "").slice(0, 160)}`, "info");
+    const goal = /\*\*Current goal:\*\*\s*(.+)/.exec(status?.body ?? "")?.[1]?.replace(/[*_`]/g, "").trim();
+    if (goal && ctx.hasUI) ctx.ui.notify(`Last time: ${goal.slice(0, 160)}`, "info");
   });
 
   // Same bytes every turn: a changing system prompt would make the server re-read the whole conversation.

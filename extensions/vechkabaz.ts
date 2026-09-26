@@ -12,7 +12,7 @@ import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-a
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const VERSION = "0.6.0";
+const VERSION = "0.6.1";
 export const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 const PROVIDER = "vechkabaz";
