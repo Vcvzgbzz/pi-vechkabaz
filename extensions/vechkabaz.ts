@@ -15,7 +15,7 @@ import { Type } from "typebox";
 const VERSION = "0.7.0";
 export const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
-const PROVIDER = "vechkabaz";
+export const PROVIDER = "vechkabaz";
 const DEFAULT_MODEL = "coder-max";
 export const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 export const KEY_FILE = join(AGENT_DIR, "vechkabaz.json");

@@ -37,6 +37,8 @@ on this machine instead, and `/memory cloud` moves them back.
 - Before each message, notes relevant to it are recalled automatically and shown to the
   model in full; you see a `↳ recalled …` line when that happens. Short replies and
   unrelated questions recall nothing. (Cloud mode only: the search runs on the server.)
+- Memory is only used with models that run on ai.vechkabaz.com's own hardware. With a
+  peer model (fable-711) pi sends no notes and the memory tool is off.
 - At the end of each session it updates a short status note for the project (goal, what
   was done, next steps), so the next session picks up where you left off.
 - `/memory` lists what's saved; `/forget project/<name>` deletes a note. In local mode the

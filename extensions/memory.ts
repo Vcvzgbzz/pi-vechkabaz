@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { AGENT_DIR, BASE, HEADERS, KEY_FILE, readJson, resolveKey } from "./vechkabaz.ts";
+import { AGENT_DIR, BASE, HEADERS, KEY_FILE, PROVIDER, readJson, resolveKey } from "./vechkabaz.ts";
 
 const ROOT = join(AGENT_DIR, "vechkabaz-memory");
 const CONFIG = join(ROOT, "config.json");
@@ -231,6 +231,21 @@ function buildBlock(all: Note[] | undefined): string {
   return parts.join("\n\n");
 }
 
+/* ------------------------------------------------------------ on-box gate */
+
+/** Server model ids that run on ai.vechkabaz.com's own hardware (`owned_by: "local"`). */
+async function localModelIds(): Promise<Set<string>> {
+  const key = resolveKey(readJson(KEY_FILE)?.apiKey);
+  if (!key) return new Set();
+  try {
+    const res = await fetch(`${BASE}/models`, { headers: { ...HEADERS, Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(8_000) });
+    const data = res.ok ? ((await res.json())?.data ?? []) : [];
+    return new Set(data.filter((m: any) => m?.owned_by === "local").map((m: any) => String(m.id)));
+  } catch {
+    return new Set(); // Unknown means off-box: notes are never sent where we cannot confirm.
+  }
+}
+
 /* ------------------------------------------------------------ recall */
 
 const RECALL_MIN_WORDS = 4;
@@ -267,9 +282,11 @@ export default function (pi: ExtensionAPI) {
   let userAsked = false;
   let userTurns = 0;
   const recalled = new Set<string>();
+  let onBox = new Set<string>();
 
   pi.on("session_start", async (_e, ctx) => {
     project = projectKey(ctx.cwd);
+    onBox = await localModelIds();
     userTurns = 0;
     recalled.clear();
     const say = (m: string) => ctx.hasUI && ctx.ui.notify(m, "info");
@@ -297,10 +314,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Same bytes every turn: a changing system prompt would make the server re-read the whole conversation.
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     webThisRun = false;
     userAsked = /\bremember\b/i.test(event.prompt ?? "");
     userTurns++;
+    // Notes hold personal details, so they only go to models running on the server's own hardware.
+    if (ctx.model?.provider !== PROVIDER || !onBox.has(ctx.model.id)) return;
     const systemPrompt = `${event.systemPrompt}\n\n${block}`;
     // Recall rides as a message after the prompt, so the frozen system prompt (and the KV cache) is untouched.
     const notes = await recallFor(event.prompt ?? "", project, recalled);
@@ -369,6 +388,9 @@ export default function (pi: ExtensionAPI) {
       new_str: Type.Optional(Type.String({ description: "For str_replace: replacement text" })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (ctx.model?.provider !== PROVIDER || !onBox.has(ctx.model.id)) {
+        return reply("Memory is off for this model: it does not run on ai.vechkabaz.com's own hardware, so saved notes are not shared with it.");
+      }
       try {
         const s = store();
         if (params.command === "view" && !params.path) {
