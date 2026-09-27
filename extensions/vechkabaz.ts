@@ -44,7 +44,6 @@ and anything you could not confirm.`;
 /** What each server model can do; ids the server lists but this table lacks get defaults. */
 const PROFILES: Record<string, { name: string; image: boolean; ctx: number }> = {
   "coder-max": { name: "coder-max (careful, 27B)", image: true, ctx: 131072 },
-  coder: { name: "coder (fast)", image: true, ctx: 262144 },
   "fable-711": { name: "fable-711 (peer machine)", image: false, ctx: 32768 },
   uncensored: { name: "uncensored", image: true, ctx: 131072 },
   "coder-sub": { name: "coder-sub (subagent, second GPU)", image: true, ctx: 131072 },
@@ -145,6 +144,19 @@ function migrate(): string[] {
   return notes;
 }
 
+/** Ids the server now refuses. */
+const RETIRED = new Set(["coder", "coder-medium", "deep"]);
+
+/** A default left on a retired id moves to this server's default model. */
+function repointRetired(): string | undefined {
+  const settingsPath = join(AGENT_DIR, "settings.json");
+  const settings = readJson(settingsPath);
+  if (settings?.defaultProvider !== PROVIDER || !RETIRED.has(settings.defaultModel)) return undefined;
+  const was = settings.defaultModel;
+  settings.defaultModel = DEFAULT_MODEL;
+  return `pi-vechkabaz: ${was} was retired, so your default model is now ${PROVIDER}/${DEFAULT_MODEL}. Backup: ${rewrite(settingsPath, settings)}`;
+}
+
 /** A fresh install with no default gets this server's default model. */
 function setDefaultIfUnset(): string | undefined {
   const settingsPath = join(AGENT_DIR, "settings.json");
@@ -170,10 +182,12 @@ async function api(path: string, key: string | undefined, signal?: AbortSignal):
 
 export default async function (pi: ExtensionAPI) {
   const notes = migrate();
+  const repointed = repointRetired();
+  if (repointed) notes.push(repointed);
   let spec: string | undefined = readJson(KEY_FILE)?.apiKey;
 
   // Live list from the server so renamed or retired models never go stale here.
-  let modelList = [toModel("coder-max"), toModel("coder")];
+  let modelList = [toModel("coder-max")];
   try {
     const listed = await api("/models", resolveKey(spec), AbortSignal.timeout(8_000));
     modelList = listed.data.map((m: any) => toModel(m.id, m.context_length ?? undefined));

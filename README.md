@@ -16,8 +16,8 @@ replaces that entry with this one, keeps your key, and saves a backup next to th
 
 ## What you get
 
-- **Models**, listed live from the server: `coder-max` (careful, the default), `coder`
-  (fast), and whatever else your account can use. Switch with `/model`.
+- **Models**, listed live from the server: `coder-max` (the default) and whatever else
+  your account can use. Switch with `/model`.
 - **`web_search`** and **`web_fetch`**: the model can look things up and read pages.
   Limited to 60 an hour.
 - **`subagent`** (on `coder-max` only): hands a big read-only investigation, like
