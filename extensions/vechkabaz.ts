@@ -12,7 +12,8 @@ import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-a
 import { Box, Markdown, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const VERSION = "0.7.0";
+// Read, not typed, so the User-Agent never lags a release.
+const VERSION: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 export const BASE = (process.env.VECHKABAZ_URL ?? "https://ai.vechkabaz.com/api/v1").replace(/\/$/, "");
 const HOST = new URL(BASE).host;
 export const PROVIDER = "vechkabaz";
@@ -31,7 +32,9 @@ const SUBAGENT_TOOLS = "read,grep,find,ls,web_search,web_fetch";
 // The child loads exactly this file, so it runs the parent's version even when the
 // parent was started with -e (nothing installed) and picks up no other extensions.
 const SELF = fileURLToPath(import.meta.url);
-const SUBAGENT_TIMEOUT_MS = 10 * 60_000;
+const SUBAGENT_TIMEOUT_MS = 15 * 60_000;
+// Past this the child's tool calls are refused, so the time left goes to writing the report.
+const SUBAGENT_WRAP_MS = SUBAGENT_TIMEOUT_MS - 3 * 60_000;
 // The server allows 3 harness turns in flight per account and the parent's own turn
 // is one of them, so 2 helpers is the most that fit beside an active conversation.
 const MAX_SUBAGENTS = 2;
@@ -281,7 +284,11 @@ export default async function (pi: ExtensionAPI) {
       let steps = 0;
       let stderr = "";
       let buf = "";
-      const timer = setTimeout(kill, SUBAGENT_TIMEOUT_MS);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        kill();
+      }, SUBAGENT_TIMEOUT_MS);
       proc.stdout.on("data", (d) => {
         buf += d.toString();
         const lines = buf.split("\n");
@@ -304,7 +311,11 @@ export default async function (pi: ExtensionAPI) {
       const finish = (code: number | null) => {
         clearTimeout(timer);
         rmSync(dir, { recursive: true, force: true });
-        resolve(report ? { report, steps } : { report, steps, error: `exit ${code}: ${stderr.trim().slice(-400) || "no report"}` });
+        // A killed or crashed child's last message is a preamble at best, never its report.
+        if (report && !timedOut && code === 0) return resolve({ report, steps });
+        const why = timedOut ? `timed out after ${SUBAGENT_TIMEOUT_MS / 60_000} min` : `exit ${code}`;
+        const last = report ? `last message: ${report.slice(0, 300)}` : stderr.trim().slice(-400) || "no report";
+        resolve({ report, steps, error: `${why}; ${last}` });
       };
       proc.on("close", finish);
       proc.on("error", () => finish(1));
@@ -394,6 +405,14 @@ export default async function (pi: ExtensionAPI) {
     }
     renderBar();
   };
+  if (IS_SUBAGENT) {
+    const startedAt = Date.now();
+    pi.on("tool_call", () =>
+      Date.now() - startedAt > SUBAGENT_WRAP_MS
+        ? { block: true, reason: "Out of time: stop investigating and write your final report now from what you already found, noting what you did not get to." }
+        : undefined);
+  }
+
   if (!IS_SUBAGENT) {
     pi.on("session_start", async (_e, ctx) => {
       renderBar(ctx);
@@ -502,6 +521,7 @@ export default async function (pi: ExtensionAPI) {
       "Use subagent for investigation that would take many file reads or searches (mapping an unfamiliar codebase, finding every usage of something, researching a library), so those contents stay out of your context. Give it a complete, self-contained task.",
       "subagent runs in the background: after starting it, tell the user and carry on with other work. Do not wait or poll for it; its report arrives on its own as a message. Up to 2 can run at once, so split independent questions across two calls.",
       "subagent cannot edit files or run commands; do the changes yourself from its report.",
+      `A subagent has ${SUBAGENT_TIMEOUT_MS / 60_000} minutes, report included: keep each task to about 7,000 lines of reading and split anything bigger. A report marked failed, or one that does not answer the task, is a failure: re-run it smaller or do it yourself.`,
     ],
     parameters: Type.Object({ task: Type.String({ description: "Complete instructions for the helper, including what to report back" }) }),
     async execute(_id, params, _signal, _onUpdate, ctx) {

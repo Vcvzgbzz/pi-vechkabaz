@@ -365,9 +365,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_compact", async (_e, ctx) => updateStatus(ctx));
 
   const parsePath = (path: string | undefined): { scope: Scope; name: string } | string => {
-    const m = /^(global|project)\/(.+)$/.exec(path ?? "");
-    if (!m) return `path must be "global/<name>" or "project/<name>"`;
-    if (!NAME.test(m[2]!)) return `name must be lowercase letters, digits and dashes (max 64)`;
+    const clean = (path ?? "").trim().replace(/^\/+/, "").replace(/\.md$/, "");
+    const m = /^(global|project)\/(.+)$/.exec(clean);
+    if (!m) return `path must be "global/<name>" or "project/<name>" (got ${JSON.stringify(path ?? null)})`;
+    if (!NAME.test(m[2]!)) return `name must be lowercase letters, digits and dashes, max 64 (got ${JSON.stringify(m[2])})`;
     return { scope: m[1] as Scope, name: m[2]! };
   };
   const reply = (text: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text }], details });
