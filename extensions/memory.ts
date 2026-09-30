@@ -6,8 +6,8 @@
  */
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -23,6 +23,12 @@ const MAX_DESC = 150;
 const MAX_INDEX = 16_000;
 const EXPIRE_MS = 60 * 86_400_000;
 const UPDATER = fileURLToPath(new URL("../lib/status-updater.mjs", import.meta.url));
+/** How far each session file has been handed to extraction (entries), so no turn is sent twice. */
+const CHECKPOINTS = join(ROOT, "extracted.json");
+/** A session left open this long gets its new turns extracted, without waiting for it to end. */
+const IDLE_MS = 30 * 60_000;
+/** Earlier sessions (crashed, killed, terminal closed) are caught up if touched this recently. */
+const CATCH_UP_MS = 7 * 86_400_000;
 // Credentials never belong in a note.
 const SECRET = /(hl_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[abp]-[A-Za-z0-9-]{10,})/;
 
@@ -314,6 +320,22 @@ export default function (pi: ExtensionAPI) {
       say(`Memory unavailable this session: ${(e as Error).message}`);
     }
     block = buildBlock(all);
+    // Sessions that ended without a shutdown (crash, kill, closed terminal) still have turns nobody extracted.
+    if (mode() === "cloud") {
+      const current = ctx.sessionManager?.getSessionFile?.();
+      const dir = current ? dirname(current) : join(AGENT_DIR, "sessions", `--${ctx.cwd.replace(/^\//, "").replace(/\//g, "-")}--`);
+      const seen = readJson(CHECKPOINTS) ?? {};
+      try {
+        readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f))
+          .filter((f) => f !== current)
+          .map((f) => ({ f, at: statSync(f).mtimeMs }))
+          .filter(({ f, at }) => Date.now() - at < CATCH_UP_MS && readFileSync(f, "utf8").split("\n").filter(Boolean).length > (seen[f] ?? 0))
+          .sort((a, b) => b.at - a.at).slice(0, 3)
+          .forEach(({ f }) => runUpdater(f, ctx.cwd, true));
+      } catch {
+        // No sessions folder yet.
+      }
+    }
     const goal = /\*\*Current goal:\*\*\s*(.+)/.exec(all?.find((n) => n.name === STATUS)?.body ?? "")?.[1]?.replace(/[*_`]/g, "").trim();
     if (goal) say(`Last time: ${goal.slice(0, 160)}`);
   });
@@ -343,11 +365,10 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName === "web_search" || event.toolName === "web_fetch") webThisRun = true;
   });
 
-  /** Summarise the session into the project status note, in a process that outlives pi. */
-  const updateStatus = (ctx: any) => {
-    const session = ctx.sessionManager?.getSessionFile?.();
+  /** Extract a session's new turns into memory and (unless extractOnly) rewrite the status note, in a process that outlives pi. */
+  const runUpdater = (session: string | undefined, cwd: string, extractOnly: boolean) => {
     const key = resolveKey(readJson(KEY_FILE)?.apiKey);
-    if (!session || !existsSync(session) || !key || userTurns === 0 || !existsSync(UPDATER)) return;
+    if (!session || !existsSync(session) || !key || !existsSync(UPDATER)) return;
     const child = spawn(process.execPath, [UPDATER], {
       detached: true,
       stdio: "ignore",
@@ -359,12 +380,27 @@ export default function (pi: ExtensionAPI) {
         MEMORY_MODE: mode(),
         PROJECT_KEY: project,
         STATUS_FILE: join(dirOf("project", project), `${STATUS}.md`),
-        PROJECT_DIR: ctx.cwd,
+        PROJECT_DIR: cwd,
+        CHECKPOINT_FILE: CHECKPOINTS,
+        STATUS: extractOnly ? "0" : "1",
       },
     });
     child.unref();
   };
+  const updateStatus = (ctx: any) => {
+    if (userTurns > 0) runUpdater(ctx.sessionManager?.getSessionFile?.(), ctx.cwd, false);
+  };
+
+  // Idle: a session left open still gets its memories taken, 30 minutes after the last turn.
+  let idle: ReturnType<typeof setTimeout> | undefined;
+  pi.on("agent_end", async (_e, ctx) => {
+    clearTimeout(idle);
+    const session = ctx.sessionManager?.getSessionFile?.();
+    idle = setTimeout(() => runUpdater(session, ctx.cwd, true), IDLE_MS);
+    idle.unref?.();
+  });
   pi.on("session_shutdown", async (e, ctx) => {
+    clearTimeout(idle);
     if (e.reason !== "reload") updateStatus(ctx);
   });
   pi.on("session_compact", async (_e, ctx) => updateStatus(ctx));
