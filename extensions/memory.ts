@@ -119,12 +119,16 @@ const localStore = {
 
 /* ------------------------------------------------------------ cloud store */
 
-async function cloud(method: string, path: string, body?: unknown): Promise<any> {
+async function cloud(method: string, path: string, body?: unknown, ifMatch?: number): Promise<any> {
   const key = resolveKey(readJson(KEY_FILE)?.apiKey);
   if (!key) throw new Error("no API key yet: run /vechkabaz-key");
   const res = await fetch(`${BASE}/memory${path}`, {
     method,
-    headers: { ...HEADERS, Authorization: `Bearer ${key}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+    headers: {
+      ...HEADERS, Authorization: `Bearer ${key}`,
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...(ifMatch === undefined ? {} : { "If-Match": `"${ifMatch}"` }),
+    },
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(15_000),
   });
@@ -151,10 +155,11 @@ const cloudStore = {
     const n = await cloud("GET", where(scope, project, name));
     return n ? fromCloud(n) : undefined;
   },
-  async put(n: Note): Promise<void> {
+  /** `expect` is the `updated` this write was based on (0 = must not exist); the server refuses it if the note moved on. */
+  async put(n: Note, expect?: number): Promise<void> {
     await cloud("PUT", where(n.scope, n.project, n.name), {
       description: n.description, body: n.body, provenance: n.provenance, created: n.created, updated: n.updated, used: n.used,
-    });
+    }, expect);
   },
   async remove(scope: Scope, project: string, name: string): Promise<boolean> {
     return Boolean((await cloud("DELETE", where(scope, project, name)))?.deleted);
@@ -167,7 +172,7 @@ const store = () =>
     ? {
         list: async (project: string) => [...localStore.list("global", ""), ...localStore.list("project", project)],
         get: async (s: Scope, p: string, n: string) => localStore.get(s, p, n),
-        put: async (n: Note) => localStore.put(n),
+        put: async (n: Note, _expect?: number) => localStore.put(n),
         remove: async (s: Scope, p: string, n: string) => localStore.remove(s, p, n),
       }
     : cloudStore;
@@ -438,7 +443,8 @@ export default function (pi: ExtensionAPI) {
           const ok = await ctx.ui.confirm("Save to memory?", `${params.path}: ${description}\n\nThis turn read web content. Save this note?`);
           if (!ok) return reply("The user declined to save this note.");
         }
-        await s.put({ scope: p.scope, project: p.scope === "project" ? project : "", name: p.name, description, provenance, body, created: existing?.created ?? now, updated: now, used: now });
+        // Based on the version read above, so an edit made meanwhile (another session, the web) is never silently overwritten.
+        await s.put({ scope: p.scope, project: p.scope === "project" ? project : "", name: p.name, description, provenance, body, created: existing?.created ?? now, updated: now, used: now }, existing?.updated ?? 0);
         if (ctx.hasUI) ctx.ui.notify(`memory saved: ${params.path}`, "info");
         return reply(`Saved ${params.path}. It appears in the index from the next session.`);
       } catch (e) {
