@@ -372,6 +372,7 @@ export default function (pi: ExtensionAPI) {
     const child = spawn(process.execPath, [UPDATER], {
       detached: true,
       stdio: "ignore",
+      windowsHide: true, // detached on Windows would otherwise open a console window
       env: {
         ...process.env,
         VECHKABAZ_KEY: key,

@@ -82,7 +82,8 @@ function argSummary(args: any): string {
 /** A pi apiKey spec — literal, $VAR / ${VAR}, or !command — to the key itself. */
 export function resolveKey(spec: string | undefined): string | undefined {
   if (!spec) return process.env.VECHKABAZ_API_KEY;
-  if (spec.startsWith("!")) return execSync(spec.slice(1), { encoding: "utf8", shell: "/bin/sh" }).trim() || undefined;
+  // Windows has no /bin/sh; there the command runs in the default shell (cmd.exe).
+  if (spec.startsWith("!")) return execSync(spec.slice(1), { encoding: "utf8", shell: process.platform === "win32" ? undefined : "/bin/sh", windowsHide: true }).trim() || undefined;
   const env = /^\$\{?(\w+)\}?$/.exec(spec);
   return env ? process.env[env[1]!] : spec;
 }
@@ -274,7 +275,7 @@ export default async function (pi: ExtensionAPI) {
     const [cmd, pre] = script && existsSync(script) ? [process.execPath, [script]] : ["pi", []];
     const args = [...pre, "--no-extensions", "-e", SELF, "--mode", "json", "-p", "--no-session", "--model", SUBAGENT_MODEL,
       "--tools", SUBAGENT_TOOLS, "--append-system-prompt", promptFile, `Task: ${task}`];
-    const proc = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_VECHKABAZ_SUBAGENT: "1" } });
+    const proc = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, PI_VECHKABAZ_SUBAGENT: "1" } });
     const kill = () => {
       proc.kill("SIGTERM");
       setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
