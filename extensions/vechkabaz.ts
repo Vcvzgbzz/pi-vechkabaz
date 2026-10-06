@@ -257,6 +257,20 @@ export default async function (pi: ExtensionAPI) {
     const active = pi.getActiveTools().filter((t) => t !== "subagent");
     pi.setActiveTools(isOrchestrator(m) ? [...active, "subagent"] : active);
   };
+  // Tells the server how many tool results in this request failed; the API format has no error flag.
+  pi.on("before_provider_headers", (e, ctx) => {
+    if (ctx.model?.provider !== PROVIDER) return;
+    let failed = 0;
+    const branch = ctx.sessionManager.getBranch();
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const entry = branch[i]!;
+      if (entry.type !== "message") continue;
+      const m = entry.message as { role?: string; isError?: boolean };
+      if (m.role === "assistant") break;
+      if (m.role === "toolResult" && m.isError) failed++;
+    }
+    e.headers["X-Vechy-Tool-Errors"] = String(failed);
+  });
   pi.on("session_start", async (_e, ctx) => syncSubagent(ctx.model));
   pi.on("model_select", async (e) => syncSubagent(e.model));
 
