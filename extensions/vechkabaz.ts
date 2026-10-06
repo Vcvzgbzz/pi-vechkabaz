@@ -20,7 +20,9 @@ export const PROVIDER = "vechkabaz";
 const DEFAULT_MODEL = "coder-max";
 export const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 export const KEY_FILE = join(AGENT_DIR, "vechkabaz.json");
-export const HEADERS = { "User-Agent": `pi-vechkabaz/${VERSION}` };
+export const HEADERS: Record<string, string> = { "User-Agent": `pi-vechkabaz/${VERSION}` };
+// A subagent child names its parent's session, so the server can group it under that session.
+if (process.env.PI_VECHKABAZ_PARENT_SESSION) HEADERS["X-Vechy-Parent"] = process.env.PI_VECHKABAZ_PARENT_SESSION;
 // The server pins this id to the second GPU, so a subagent never evicts the parent's model.
 const SUBAGENT_MODEL = `${PROVIDER}/coder-sub`;
 // Only this parent model gets the subagent tool; everything else never sees it.
@@ -68,7 +70,8 @@ function toModel(id: string, ctx?: number) {
     contextWindow,
     // The server clamps output to 32k or half the window, whichever is smaller.
     maxTokens: Math.min(32768, Math.floor(contextWindow / 2)),
-    compat: { supportsDeveloperRole: false, supportsStore: false, maxTokensField: "max_tokens" as const },
+    // Session-affinity headers carry pi's session id, which the server uses to group turns.
+    compat: { supportsDeveloperRole: false, supportsStore: false, maxTokensField: "max_tokens" as const, sendSessionAffinityHeaders: true },
   };
 }
 
@@ -267,7 +270,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   /** Runs the child pi to completion; resolves with its last assistant text. */
-  const runChild = (task: string, cwd: string, onStep: (steps: number, tool: string, args: any) => void) => {
+  const runChild = (task: string, cwd: string, parentSession: string, onStep: (steps: number, tool: string, args: any) => void) => {
     const dir = mkdtempSync(join(tmpdir(), "pi-vechkabaz-sub-"));
     const promptFile = join(dir, "subagent.md");
     writeFileSync(promptFile, SUBAGENT_PROMPT, { mode: 0o600 });
@@ -275,7 +278,7 @@ export default async function (pi: ExtensionAPI) {
     const [cmd, pre] = script && existsSync(script) ? [process.execPath, [script]] : ["pi", []];
     const args = [...pre, "--no-extensions", "-e", SELF, "--mode", "json", "-p", "--no-session", "--model", SUBAGENT_MODEL,
       "--tools", SUBAGENT_TOOLS, "--append-system-prompt", promptFile, `Task: ${task}`];
-    const proc = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, PI_VECHKABAZ_SUBAGENT: "1" } });
+    const proc = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, PI_VECHKABAZ_SUBAGENT: "1", PI_VECHKABAZ_PARENT_SESSION: parentSession } });
     const kill = () => {
       proc.kill("SIGTERM");
       setTimeout(() => proc.kill("SIGKILL"), 5000).unref();
@@ -538,7 +541,7 @@ export default async function (pi: ExtensionAPI) {
       const id = nextId++;
       const started = Date.now();
       const status = () => renderBar(ctx);
-      const child = runChild(params.task, ctx.cwd, (steps, tool, args) => {
+      const child = runChild(params.task, ctx.cwd, ctx.sessionManager.getSessionId(), (steps, tool, args) => {
         const r = running.get(id);
         if (r) {
           r.steps = steps;
